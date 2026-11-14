@@ -1,0 +1,158 @@
+{
+  "entities": {
+    "SiteSettingsPublic": {
+      "title": "SiteSettingsPublic",
+      "description": "Public editable website configuration, branding, packages, FAQs, footer, currencies, and email templates (zero secrets).",
+      "type": "object",
+      "properties": {
+        "branding": {
+          "type": "object",
+          "description": "Site title, short brand name, logo URL, badge monogram, and admin email."
+        },
+        "footerConfig": {
+          "type": "object",
+          "description": "Company phone, email, WhatsApp, physical address, business hours, narrative, and copyright notice."
+        },
+        "content": {
+          "type": "object",
+          "description": "Homepage headlines, KPIs, process steps, FAQs, and policy narratives."
+        },
+        "packages": {
+          "type": "array",
+          "description": "Published Done-For-You campaign packages."
+        },
+        "services": {
+          "type": "array",
+          "description": "Advertising service definitions."
+        },
+        "currencies": {
+          "type": "array",
+          "description": "Multi-currency exchange rates and margins."
+        },
+        "pricingConfig": {
+          "type": "object",
+          "description": "Pricing engine rules."
+        },
+        "autoRateEngine": {
+          "type": "object",
+          "description": "Automatic currency change detection settings."
+        },
+        "emailTemplates": {
+          "type": "object",
+          "description": "Editable email templates synced with site branding."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of latest update."
+        }
+      },
+      "required": ["branding", "footerConfig", "content", "packages", "updatedAt"]
+    },
+    "OrderRecord": {
+      "title": "OrderRecord",
+      "description": "Customer campaign order and Paystack settlement record.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "customerId": { "type": "string", "maxLength": 128 },
+        "customerEmail": { "type": "string", "format": "email", "maxLength": 254 },
+        "customerName": { "type": "string", "maxLength": 120 },
+        "customerPhone": { "type": "string", "maxLength": 40 },
+        "serviceId": { "type": "string", "maxLength": 80 },
+        "serviceName": { "type": "string", "maxLength": 160 },
+        "packageId": { "type": "string", "maxLength": 80 },
+        "packageName": { "type": "string", "maxLength": 160 },
+        "fundingArrangement": { "type": "string", "enum": ["COMBINED", "MANAGEMENT_ONLY"] },
+        "pricingCurrency": { "type": "string", "maxLength": 10 },
+        "adBudgetUSD": { "type": "number" },
+        "agencyFeeUSD": { "type": "number" },
+        "taxUSD": { "type": "number" },
+        "totalUSD": { "type": "number" },
+        "paymentCurrency": { "type": "string", "maxLength": 10 },
+        "appliedExchangeRate": { "type": "number" },
+        "exchangeRateMarginPercent": { "type": "number" },
+        "paymentAdBudget": { "type": "number" },
+        "paymentAgencyFee": { "type": "number" },
+        "paymentTax": { "type": "number" },
+        "paymentTotal": { "type": "number" },
+        "paymentStatus": { "type": "string", "enum": ["PENDING", "PAID", "FAILED", "REFUNDED"] },
+        "paymentReference": { "type": "string", "maxLength": 160 },
+        "receiptNumber": { "type": "string", "maxLength": 80 },
+        "campaignStatus": {
+          "type": "string",
+          "enum": ["DRAFT", "SUBMITTED", "UNDER_REVIEW", "APPROVED", "LAUNCHED_ACTIVE", "COMPLETED"]
+        },
+        "campaignBrief": { "type": "object" },
+        "performance": { "type": "object" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "customerEmail", "customerName", "paymentCurrency", "paymentTotal", "paymentStatus", "campaignStatus", "createdAt", "updatedAt"]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated customer or administrator account metadata.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128 },
+        "email": { "type": "string", "format": "email", "maxLength": 254 },
+        "name": { "type": "string", "maxLength": 120 },
+        "phone": { "type": "string", "maxLength": 40 },
+        "role": { "type": "string", "enum": ["customer", "admin", "staff"] },
+        "authProvider": { "type": "string", "enum": ["email", "google"] },
+        "status": { "type": "string", "enum": ["active", "suspended"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "name", "role", "status", "createdAt", "updatedAt"]
+    },
+    "AdminMarker": {
+      "title": "AdminMarker",
+      "description": "Trusted administrator lookup document.",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "format": "email", "maxLength": 254 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["email"]
+    },
+    "PasswordResetTicket": {
+      "title": "PasswordResetTicket",
+      "description": "Password reset inquiry managed by the administrator.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userEmail": { "type": "string", "format": "email", "maxLength": 254 },
+        "userName": { "type": "string", "maxLength": 120 },
+        "status": { "type": "string", "enum": ["pending", "resolved"] },
+        "requestedAt": { "type": "string", "format": "date-time" },
+        "resolvedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userEmail", "userName", "status", "requestedAt"]
+    }
+  },
+  "firestore": {
+    "/site_settings/{settingId}": {
+      "schema": { "$ref": "#/entities/SiteSettingsPublic" },
+      "description": "Publicly readable website branding, packages, FAQs, footer, currencies, and email templates (ID: public)."
+    },
+    "/orders/{orderId}": {
+      "schema": { "$ref": "#/entities/OrderRecord" },
+      "description": "Customer campaign orders and verified Paystack settlement receipts."
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private user account profiles."
+    },
+    "/admins/{adminId}": {
+      "schema": { "$ref": "#/entities/AdminMarker" },
+      "description": "Trusted administrator directory."
+    },
+    "/password_resets/{resetId}": {
+      "schema": { "$ref": "#/entities/PasswordResetTicket" },
+      "description": "Client password reset queue resolved by admin."
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "AdPulse Global | Meta Advertising Agency & Campaign Platform",
+  "description": "Professional Meta advertising agency platform with automated pricing calculation, multi-currency engine, Paystack payments, and full campaign lifecycle management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

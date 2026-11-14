@@ -1,0 +1,363 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net (Default-Deny Catch-All)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Reusable Hardened Primitives ---
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isAdmin() {
+      return isVerifiedUser() && (
+        request.auth.token.email == 'baffourgideon05@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isValidString(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    }
+
+    // --- Validation Blueprints ---
+    function isValidSiteSettings(data) {
+      return data.keys().hasAll(['branding', 'footerConfig', 'content', 'packages', 'updatedAt'])
+        && data.keys().hasOnly([
+          'branding',
+          'footerConfig',
+          'content',
+          'packages',
+          'services',
+          'currencies',
+          'pricingConfig',
+          'autoRateEngine',
+          'emailTemplates',
+          'updatedAt'
+        ])
+        && data.branding is map
+        && data.branding.keys().hasAll(['siteTitle', 'siteShortName', 'logoUrl', 'logoBadgeText', 'adminGoogleEmail'])
+        && data.branding.keys().hasOnly(['siteTitle', 'siteShortName', 'logoUrl', 'logoBadgeText', 'adminGoogleEmail'])
+        && isValidString(data.branding.siteTitle, 1, 200)
+        && isValidString(data.branding.siteShortName, 1, 100)
+        && isValidString(data.branding.logoUrl, 0, 1000)
+        && isValidString(data.branding.logoBadgeText, 0, 10)
+        && isValidString(data.branding.adminGoogleEmail, 3, 254)
+        && data.footerConfig is map
+        && data.footerConfig.keys().hasAll(['phone', 'email', 'address', 'businessHours', 'whatsappNumber', 'aboutText', 'copyrightNotice'])
+        && data.footerConfig.keys().hasOnly([
+          'phone',
+          'email',
+          'address',
+          'businessHours',
+          'whatsappNumber',
+          'aboutText',
+          'copyrightNotice',
+          'facebookUrl',
+          'instagramUrl',
+          'linkedinUrl'
+        ])
+        && isValidString(data.footerConfig.phone, 0, 60)
+        && isValidString(data.footerConfig.email, 0, 254)
+        && isValidString(data.footerConfig.address, 0, 300)
+        && isValidString(data.footerConfig.businessHours, 0, 160)
+        && isValidString(data.footerConfig.whatsappNumber, 0, 60)
+        && isValidString(data.footerConfig.aboutText, 0, 1200)
+        && isValidString(data.footerConfig.copyrightNotice, 0, 300)
+        && data.content is map
+        && isValidString(data.content.headline, 1, 300)
+        && isValidString(data.content.subheadline, 0, 1000)
+        && data.packages is list
+        && data.packages.size() <= 25
+        && (data.packages.size() == 0 || data.packages[0] is map)
+        && (!('services' in data) || (data.services is list && data.services.size() <= 25 && (data.services.size() == 0 || data.services[0] is map)))
+        && (!('currencies' in data) || (data.currencies is list && data.currencies.size() <= 30 && (data.currencies.size() == 0 || data.currencies[0] is map)))
+        && (!('pricingConfig' in data) || data.pricingConfig is map)
+        && (!('autoRateEngine' in data) || data.autoRateEngine is map)
+        && (!('emailTemplates' in data) || data.emailTemplates is map)
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCampaignBrief(brief) {
+      return brief is map
+        && brief.keys().hasOnly([
+          'businessName',
+          'websiteUrl',
+          'platform',
+          'objective',
+          'targetLocations',
+          'targetAge',
+          'targetInterests',
+          'headline',
+          'primaryText',
+          'callToAction',
+          'destinationUrl',
+          'facebookPageOrHandle',
+          'specialInstructions'
+        ])
+        && (!('businessName' in brief) || isValidString(brief.businessName, 0, 160))
+        && (!('headline' in brief) || isValidString(brief.headline, 0, 240))
+        && (!('primaryText' in brief) || isValidString(brief.primaryText, 0, 1200))
+        && (!('destinationUrl' in brief) || isValidString(brief.destinationUrl, 0, 400))
+        && (!('specialInstructions' in brief) || isValidString(brief.specialInstructions, 0, 1000));
+    }
+
+    function isValidOrder(data) {
+      return data.keys().hasAll([
+          'id',
+          'ownerUid',
+          'customerEmail',
+          'customerName',
+          'paymentCurrency',
+          'paymentTotal',
+          'paymentStatus',
+          'campaignStatus',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id',
+          'ownerUid',
+          'customerId',
+          'customerEmail',
+          'customerName',
+          'customerPhone',
+          'serviceId',
+          'serviceName',
+          'packageId',
+          'packageName',
+          'fundingArrangement',
+          'pricingCurrency',
+          'adBudgetUSD',
+          'agencyFeeUSD',
+          'taxUSD',
+          'totalUSD',
+          'paymentCurrency',
+          'appliedExchangeRate',
+          'exchangeRateMarginPercent',
+          'paymentAdBudget',
+          'paymentAgencyFee',
+          'paymentTax',
+          'paymentTotal',
+          'rateSnapshot',
+          'paymentStatus',
+          'paymentReference',
+          'paymentChannel',
+          'paidAt',
+          'receiptNumber',
+          'campaignBrief',
+          'campaignStatus',
+          'assignedStaff',
+          'reviewNotes',
+          'performance',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidString(data.ownerUid, 1, 128)
+        && isValidString(data.customerEmail, 3, 254)
+        && isValidString(data.customerName, 1, 120)
+        && (!('customerPhone' in data) || isValidString(data.customerPhone, 0, 40))
+        && isValidString(data.paymentCurrency, 2, 10)
+        && data.paymentTotal is number
+        && data.paymentTotal >= 0
+        && data.paymentStatus in ['PENDING', 'PAID', 'FAILED', 'REFUNDED']
+        && data.campaignStatus in ['DRAFT', 'SUBMITTED', 'UNDER_REVIEW', 'APPROVED', 'LAUNCHED_ACTIVE', 'COMPLETED']
+        && (!('campaignBrief' in data) || isValidCampaignBrief(data.campaignBrief))
+        && (!('performance' in data) || data.performance is map)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'name', 'role', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'name', 'phone', 'role', 'authProvider', 'avatarUrl', 'status', 'createdAt', 'updatedAt'])
+        && data.uid == userId
+        && isValidString(data.email, 3, 254)
+        && isValidString(data.name, 1, 120)
+        && (!('phone' in data) || isValidString(data.phone, 0, 40))
+        && data.role in ['customer', 'admin', 'staff']
+        && data.status in ['active', 'suspended']
+        && (!('authProvider' in data) || data.authProvider in ['email', 'google'])
+        && (!('avatarUrl' in data) || isValidString(data.avatarUrl, 0, 500))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidPasswordReset(data) {
+      return data.keys().hasAll(['id', 'userEmail', 'userName', 'status', 'requestedAt'])
+        && data.keys().hasOnly(['id', 'userEmail', 'userName', 'status', 'requestedAt', 'resolvedAt', 'resolvedBy'])
+        && isValidId(data.id)
+        && isValidString(data.userEmail, 3, 254)
+        && isValidString(data.userName, 1, 120)
+        && data.status in ['pending', 'resolved']
+        && data.requestedAt is timestamp
+        && (!('resolvedAt' in data) || data.resolvedAt is timestamp)
+        && (!('resolvedBy' in data) || isValidString(data.resolvedBy, 3, 254));
+    }
+
+    // --- Collection Rules ---
+
+    // 1. Site Settings (Public non-secret storefront config & templates)
+    match /site_settings/{settingId} {
+      allow get: if isValidId(settingId) && settingId == 'public';
+      allow list: if isAdmin();
+      allow create: if isAdmin()
+        && isValidId(settingId)
+        && settingId == 'public'
+        && isValidSiteSettings(incoming())
+        && incoming().updatedAt == request.time;
+      allow update: if isAdmin()
+        && isValidId(settingId)
+        && settingId == 'public'
+        && isValidSiteSettings(incoming())
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'branding',
+          'footerConfig',
+          'content',
+          'packages',
+          'services',
+          'currencies',
+          'pricingConfig',
+          'autoRateEngine',
+          'emailTemplates',
+          'updatedAt'
+        ]);
+      allow delete: if false;
+    }
+
+    // 2. Orders (PII Isolated, Zero Fake-Paid Writes, Terminal State Locked)
+    match /orders/{orderId} {
+      allow get: if isValidId(orderId) && isVerifiedUser() && (
+        isAdmin() ||
+        existing().ownerUid == request.auth.uid ||
+        existing().customerEmail == request.auth.token.email
+      );
+
+      allow list: if isVerifiedUser() && (
+        isAdmin() ||
+        resource.data.ownerUid == request.auth.uid ||
+        resource.data.customerEmail == request.auth.token.email
+      );
+
+      allow create: if isValidId(orderId)
+        && isVerifiedUser()
+        && isValidOrder(incoming())
+        && incoming().id == orderId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          (
+            incoming().ownerUid == request.auth.uid &&
+            incoming().customerEmail == request.auth.token.email &&
+            incoming().paymentStatus == 'PENDING' &&
+            incoming().campaignStatus == 'DRAFT'
+          )
+        );
+
+      allow update: if isValidId(orderId)
+        && isVerifiedUser()
+        && isValidOrder(incoming())
+        && incoming().id == existing().id
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          (
+            existing().campaignStatus != 'COMPLETED' &&
+            (existing().ownerUid == request.auth.uid || existing().customerEmail == request.auth.token.email) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['campaignBrief', 'updatedAt'])
+          )
+        );
+
+      allow delete: if isAdmin() && isValidId(orderId);
+    }
+
+    // 3. Users (Strict PII Isolation, Prevent Self-Assigned Admin)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isVerifiedUser() && (request.auth.uid == userId || isAdmin());
+      allow list: if isAdmin();
+
+      allow create: if isValidId(userId)
+        && isVerifiedUser()
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          (
+            request.auth.uid == userId &&
+            incoming().email == request.auth.token.email &&
+            incoming().role == 'customer' &&
+            incoming().status == 'active'
+          )
+        );
+
+      allow update: if isValidId(userId)
+        && isVerifiedUser()
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin() ||
+          (
+            request.auth.uid == userId &&
+            incoming().role == existing().role &&
+            incoming().status == existing().status &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'phone', 'avatarUrl', 'updatedAt'])
+          )
+        );
+
+      allow delete: if isAdmin() && isValidId(userId);
+    }
+
+    // 4. Admins (Read-Only for Verified Admin; No Client-Side Self-Promotion)
+    match /admins/{adminId} {
+      allow get: if isValidId(adminId) && isAdmin();
+      allow list: if false;
+      allow create, update, delete: if false;
+    }
+
+    // 5. Password Reset Requests
+    match /password_resets/{resetId} {
+      allow get, list: if isAdmin();
+      allow create: if isValidId(resetId)
+        && isVerifiedUser()
+        && isValidPasswordReset(incoming())
+        && incoming().id == resetId
+        && incoming().status == 'pending'
+        && incoming().userEmail == request.auth.token.email
+        && incoming().requestedAt == request.time;
+      allow update: if isAdmin()
+        && isValidId(resetId)
+        && isValidPasswordReset(incoming())
+        && incoming().id == existing().id
+        && incoming().requestedAt == existing().requestedAt
+        && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'resolvedAt', 'resolvedBy']);
+      allow delete: if isAdmin() && isValidId(resetId);
+    }
+  }
+}
