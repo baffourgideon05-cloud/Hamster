@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -47,6 +48,7 @@ export interface AppDatabase {
   brevoConfig: BrevoConfig;
   emailTemplates: EmailTemplatesConfig;
   emailLogs: EmailLog[];
+  updatedAt?: string;
 }
 
 const DEFAULT_BRANDING: SiteBranding = {
@@ -607,7 +609,8 @@ class DataStore {
       paystackConfig: { ...DEFAULT_PAYSTACK_CONFIG },
       brevoConfig: { ...DEFAULT_BREVO_CONFIG },
       emailTemplates: JSON.parse(JSON.stringify(DEFAULT_EMAIL_TEMPLATES)),
-      emailLogs: []
+      emailLogs: [],
+      updatedAt: '2026-01-01T00:00:00.000Z'
     };
 
     this.saveData(initialDb);
@@ -616,6 +619,10 @@ class DataStore {
 
   private ensureDefaults() {
     let modified = false;
+    if (!this.db.updatedAt) {
+      this.db.updatedAt = '2026-01-01T00:00:00.000Z';
+      modified = true;
+    }
     if (!this.db.branding) {
       this.db.branding = DEFAULT_BRANDING;
       modified = true;
@@ -629,7 +636,15 @@ class DataStore {
       modified = true;
     }
     if (!this.db.paystackConfig || !this.db.paystackConfig.secretKey || this.db.paystackConfig.secretKey.startsWith('sk_test')) {
-      this.db.paystackConfig = { ...DEFAULT_PAYSTACK_CONFIG };
+      this.db.paystackConfig = {
+        secretKey: process.env.PAYSTACK_SECRET_KEY || '',
+        publicKey: process.env.VITE_PAYSTACK_PUBLIC_KEY || 'pk_live_93621f2292fc2f1396ddc18fea182881a6f55e1b',
+        isLive: true
+      };
+      modified = true;
+    }
+    if (!this.db.paystackConfig.publicKey) {
+      this.db.paystackConfig.publicKey = process.env.VITE_PAYSTACK_PUBLIC_KEY || 'pk_live_93621f2292fc2f1396ddc18fea182881a6f55e1b';
       modified = true;
     }
     if (!this.db.brevoConfig) {
@@ -782,7 +797,9 @@ class DataStore {
 
   private saveData(data: AppDatabase) {
     try {
-      fs.writeFileSync(DATA_FILE_PATH, JSON.stringify(data, null, 2), 'utf-8');
+      const tmpPath = `${DATA_FILE_PATH}.tmp`;
+      fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf-8');
+      fs.renameSync(tmpPath, DATA_FILE_PATH);
     } catch (e) {
       console.error('Error saving data store:', e);
     }
@@ -792,8 +809,26 @@ class DataStore {
     return this.db;
   }
 
-  public commit() {
+  public commit(bumpUpdatedAt = false) {
+    if (bumpUpdatedAt) {
+      this.db.updatedAt = new Date().toISOString();
+    }
     this.saveData(this.db);
+  }
+
+  public restoreConfigSnapshot(snapshot: Partial<AppDatabase> & { updatedAt?: string }) {
+    if (snapshot.branding) this.db.branding = { ...this.db.branding, ...snapshot.branding };
+    if (snapshot.footerConfig) this.db.footerConfig = { ...this.db.footerConfig, ...snapshot.footerConfig };
+    if (snapshot.content) this.db.content = { ...this.db.content, ...snapshot.content };
+    if (Array.isArray(snapshot.packages) && snapshot.packages.length > 0) this.db.packages = snapshot.packages;
+    if (Array.isArray(snapshot.services) && snapshot.services.length > 0) this.db.services = snapshot.services;
+    if (Array.isArray(snapshot.currencies) && snapshot.currencies.length > 0) this.db.currencies = snapshot.currencies;
+    if (snapshot.pricingConfig) this.db.pricingConfig = { ...this.db.pricingConfig, ...snapshot.pricingConfig };
+    if (snapshot.autoRateEngine) this.db.autoRateEngine = { ...this.db.autoRateEngine, ...snapshot.autoRateEngine };
+    if (snapshot.emailTemplates) this.db.emailTemplates = { ...this.db.emailTemplates, ...snapshot.emailTemplates };
+    this.db.updatedAt = snapshot.updatedAt || new Date().toISOString();
+    this.saveData(this.db);
+    return this.db;
   }
 
   // --- User Authentication & Verification ---
@@ -942,7 +977,7 @@ class DataStore {
       ...this.db.branding,
       ...branding
     };
-    this.commit();
+    this.commit(true);
     return this.db.branding;
   }
 
@@ -956,7 +991,7 @@ class DataStore {
     if (footer.phone) this.db.content.agencyPhone = footer.phone;
     if (footer.address) this.db.content.agencyAddress = footer.address;
     if (footer.businessHours) this.db.content.businessHours = footer.businessHours;
-    this.commit();
+    this.commit(true);
     return this.db.footerConfig;
   }
 
@@ -1254,7 +1289,7 @@ class DataStore {
         ...(templates.passwordReset || {})
       }
     };
-    this.commit();
+    this.commit(true);
     return this.db.emailTemplates;
   }
 

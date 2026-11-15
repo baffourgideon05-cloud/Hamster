@@ -1,13 +1,11 @@
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
 import { store } from './src/server/dataStore.ts';
 import { BrevoEmailService } from './src/server/brevoService.ts';
 import { CurrencyCode, FundingArrangement } from './src/types/index.ts';
-
-dotenv.config();
 
 const brevoService = new BrevoEmailService(store.getDb().brevoConfig);
 
@@ -49,7 +47,8 @@ app.get('/api/config', (_req, res) => {
     autoRateEngine: db.autoRateEngine,
     paystackPublicKey: process.env.VITE_PAYSTACK_PUBLIC_KEY || db.paystackConfig.publicKey || 'pk_live_93621f2292fc2f1396ddc18fea182881a6f55e1b',
     brevoConfigured: Boolean((db.brevoConfig?.apiKey || process.env.BREVO_API_KEY) && db.brevoConfig?.isEnabled),
-    emailTemplates: db.emailTemplates
+    emailTemplates: db.emailTemplates,
+    updatedAt: db.updatedAt || '2026-01-01T00:00:00.000Z'
   });
 });
 
@@ -241,6 +240,16 @@ app.post('/api/admin/auto-rate/trigger', (_req, res) => {
   }
 });
 
+// Admin: Restore Config Snapshot from Cloud Firestore
+app.post('/api/admin/restore-config', (req, res) => {
+  try {
+    const updatedDb = store.restoreConfigSnapshot(req.body || {});
+    res.json({ success: true, updatedAt: updatedDb.updatedAt });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to restore config snapshot', details: err.message });
+  }
+});
+
 // Admin: Update Auto Rate Engine Configuration
 app.post('/api/admin/auto-rate/config', (req, res) => {
   try {
@@ -249,8 +258,8 @@ app.post('/api/admin/auto-rate/config', (req, res) => {
       ...db.autoRateEngine,
       ...req.body
     };
-    store.commit();
-    res.json({ success: true, autoRateEngine: db.autoRateEngine });
+    store.commit(true);
+    res.json({ success: true, autoRateEngine: db.autoRateEngine, updatedAt: db.updatedAt });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to update auto rate config', details: err.message });
   }
@@ -782,11 +791,12 @@ app.post('/api/admin/currencies/:code', (req, res) => {
   let detection = null;
   if (rateVsUSD && Number(rateVsUSD) > 0) {
     detection = store.updateExchangeRate(code as CurrencyCode, Number(rateVsUSD), 'Admin Manual Adjustment');
+    store.commit(true);
   } else {
-    store.commit();
+    store.commit(true);
   }
 
-  res.json({ currency, detection });
+  res.json({ currency, detection, updatedAt: db.updatedAt });
 });
 
 // Update Pricing Config (Admin)
@@ -796,7 +806,7 @@ app.post('/api/admin/pricing', (req, res) => {
     ...db.pricingConfig,
     ...req.body
   };
-  store.commit();
+  store.commit(true);
   res.json(db.pricingConfig);
 });
 
@@ -811,7 +821,7 @@ app.post('/api/admin/services', (req, res) => {
     service.id = service.id || `srv-${Date.now()}`;
     db.services.push(service);
   }
-  store.commit();
+  store.commit(true);
   res.json(db.services);
 });
 
@@ -825,7 +835,7 @@ app.post('/api/admin/packages', (req, res) => {
     pkg.id = pkg.id || `pkg-${Date.now()}`;
     db.packages.push(pkg);
   }
-  store.commit();
+  store.commit(true);
   res.json(db.packages);
 });
 
@@ -833,8 +843,8 @@ app.delete('/api/admin/packages/:id', (req, res) => {
   const db = store.getDb();
   const { id } = req.params;
   db.packages = db.packages.filter(p => p.id !== id);
-  store.commit();
-  res.json(db.packages);
+  store.commit(true);
+  res.json({ success: true, packages: db.packages, updatedAt: db.updatedAt });
 });
 
 // Update Website Content (Admin)
@@ -844,7 +854,7 @@ app.post('/api/admin/content', (req, res) => {
     ...db.content,
     ...req.body
   };
-  store.commit();
+  store.commit(true);
   res.json(db.content);
 });
 

@@ -207,6 +207,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   useEffect(() => {
     testFirestoreConnection().then(setFirestoreOnline).catch(() => setFirestoreOnline(false));
     setFirebaseUserEmail(getFirebaseCurrentUser()?.email || null);
+    loadIntegrations();
   }, []);
 
   const loadAccountsAndResets = async () => {
@@ -340,6 +341,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     try {
       const fbUser = await signInWithGooglePopup();
       setFirebaseUserEmail(fbUser.email);
+      await api.adminSaveSiteBrandingAndContent(brandingForm, contentForm);
+      await onRefreshAll();
       showAdminNotice(`Connected Google Workspace (${fbUser.email}). Cloud Firestore write sync and Gmail API are now active!`);
     } catch (err: any) {
       showAdminNotice(err?.message || 'Google connection cancelled or blocked.', 'error');
@@ -351,10 +354,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const handleSaveBranding = async () => {
     setIsSavingBranding(true);
     try {
-      await Promise.all([
-        api.adminUpdateBranding(brandingForm),
-        api.adminUpdateContent(contentForm)
-      ]);
+      const res = await api.adminSaveSiteBrandingAndContent(brandingForm, contentForm);
       if (brandingForm.siteTitle) {
         document.title = brandingForm.siteTitle;
         const ogTitle = document.querySelector('meta[property="og:title"]');
@@ -366,8 +366,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         const ogDesc = document.querySelector('meta[property="og:description"]');
         if (ogDesc) ogDesc.setAttribute('content', contentForm.metaDescription);
       }
-      onRefreshAll();
-      showAdminNotice('Website titles, SEO meta, hero sections, FAQs, and branding saved permanently!');
+      await onRefreshAll();
+      showAdminNotice(
+        res.cloudSynced
+          ? 'Website titles, SEO meta, hero sections, FAQs, and branding saved to Server & Cloud Firestore!'
+          : 'Website titles, SEO meta, hero sections, FAQs, and branding saved! (Connect Admin Google button above to mirror to Cloud Firestore across devices.)'
+      );
     } catch (err: any) {
       showAdminNotice(err?.message || 'Failed to update branding and website content.', 'error');
     } finally {
@@ -2902,15 +2906,20 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 </button>
                 <button
                   onClick={async () => {
-                    await api.adminUpdateCurrency(selectedCurrency.code, {
-                      rateVsUSD: editRate || selectedCurrency.rateVsUSD,
-                      marginPercent: editMargin !== undefined ? editMargin : selectedCurrency.marginPercent,
-                      supportedForPayment: editPaystackSupport
-                    });
-                    setSelectedCurrency(null);
-                    onRefreshAll();
+                    try {
+                      await api.adminUpdateCurrency(selectedCurrency.code, {
+                        rateVsUSD: editRate || selectedCurrency.rateVsUSD,
+                        marginPercent: editMargin !== undefined ? editMargin : selectedCurrency.marginPercent,
+                        supportedForPayment: editPaystackSupport
+                      });
+                      setSelectedCurrency(null);
+                      await onRefreshAll();
+                      showAdminNotice(`${selectedCurrency.code} exchange rate and margin saved!`);
+                    } catch {
+                      showAdminNotice(`Failed to save ${selectedCurrency.code} rate update.`, 'error');
+                    }
                   }}
-                  className="px-4 py-2 bg-neutral-950 text-white rounded-xl text-xs font-semibold"
+                  className="px-4 py-2 bg-neutral-950 text-white rounded-xl text-xs font-semibold cursor-pointer"
                 >
                   Save Changes
                 </button>

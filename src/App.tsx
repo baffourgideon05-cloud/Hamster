@@ -10,7 +10,13 @@ import {
   UserAccount
 } from './types/index.ts';
 import { api, PlatformConfigResponse } from './services/api.ts';
-import { firebaseSignOutAll, testFirestoreConnection } from './firebase.ts';
+import {
+  firebaseSignOutAll,
+  testFirestoreConnection,
+  subscribeSiteSettings,
+  subscribeOrdersFromFirestore,
+  FirestoreSiteSettings
+} from './firebase.ts';
 import { Navbar } from './components/Navbar.tsx';
 import { HeroSection } from './components/HeroSection.tsx';
 import { PackagesSection } from './components/PackagesSection.tsx';
@@ -48,28 +54,41 @@ export default function App() {
   // Flash Notification
   const [notification, setNotification] = useState<{ type: 'success' | 'info'; message: string } | null>(null);
 
+  const syncDocumentHead = (cfg: PlatformConfigResponse) => {
+    if (cfg.branding?.siteTitle) {
+      document.title = cfg.branding.siteTitle;
+      const ogTitle = document.querySelector('meta[property="og:title"]');
+      if (ogTitle) ogTitle.setAttribute('content', cfg.branding.siteTitle);
+    }
+    if (cfg.content?.metaDescription) {
+      const metaDesc = document.querySelector('meta[name="description"]');
+      if (metaDesc) metaDesc.setAttribute('content', cfg.content.metaDescription);
+      const ogDesc = document.querySelector('meta[property="og:description"]');
+      if (ogDesc) ogDesc.setAttribute('content', cfg.content.metaDescription);
+    }
+  };
+
+  const applyConfigState = (nextCfg: PlatformConfigResponse) => {
+    setConfig((prev) => {
+      const prevMs = prev?.updatedAtMillis || 0;
+      const nextMs = nextCfg?.updatedAtMillis || 0;
+      if (prevMs > 0 && nextMs > 0 && nextMs < prevMs) {
+        return prev;
+      }
+      return nextCfg;
+    });
+    syncDocumentHead(nextCfg);
+  };
+
   const loadData = async (isRetry = false) => {
     try {
       const [cfg, ords] = await Promise.all([
         api.getConfig(),
         api.getOrders()
       ]);
-      setConfig(cfg);
+      applyConfigState(cfg);
       setOrders(ords);
       setLoadError(null);
-
-      // Dynamically sync browser tab title, meta description & OG tags with configured site branding
-      if (cfg.branding?.siteTitle) {
-        document.title = cfg.branding.siteTitle;
-        const ogTitle = document.querySelector('meta[property="og:title"]');
-        if (ogTitle) ogTitle.setAttribute('content', cfg.branding.siteTitle);
-      }
-      if (cfg.content?.metaDescription) {
-        const metaDesc = document.querySelector('meta[name="description"]');
-        if (metaDesc) metaDesc.setAttribute('content', cfg.content.metaDescription);
-        const ogDesc = document.querySelector('meta[property="og:description"]');
-        if (ogDesc) ogDesc.setAttribute('content', cfg.content.metaDescription);
-      }
     } catch (err: any) {
       console.warn('LoadData notice:', err);
       if (!isRetry) {
@@ -83,6 +102,62 @@ export default function App() {
   useEffect(() => {
     loadData();
     testFirestoreConnection().catch(() => {});
+
+    // Instant local mutation reflection across all views & components
+    const onLocalConfigUpdated = (e: Event) => {
+      const custom = e as CustomEvent<PlatformConfigResponse>;
+      if (custom.detail) {
+        applyConfigState(custom.detail);
+      }
+    };
+    const onLocalOrdersUpdated = () => {
+      api.getOrders().then(setOrders).catch(() => {});
+    };
+    window.addEventListener('adpulse-config-updated', onLocalConfigUpdated);
+    window.addEventListener('adpulse-orders-updated', onLocalOrdersUpdated);
+
+    // Real-time Cloud Firestore listener for live public site settings
+    const unsubSettings = subscribeSiteSettings((fsSettings: FirestoreSiteSettings) => {
+      const fsMs = fsSettings.updatedAtMillis || 0;
+      setConfig((prev) => {
+        const prevMs = prev?.updatedAtMillis || 0;
+        if (!fsMs || fsMs <= prevMs) return prev;
+        const next: PlatformConfigResponse = {
+          ...prev,
+          ...(fsSettings.branding ? { branding: fsSettings.branding } : {}),
+          ...(fsSettings.footerConfig ? { footerConfig: fsSettings.footerConfig } : {}),
+          ...(fsSettings.content ? { content: { ...prev.content, ...fsSettings.content } } : {}),
+          ...(Array.isArray(fsSettings.packages) && fsSettings.packages.length > 0
+            ? {
+                packages: fsSettings.packages.filter((p) => p.status !== 'inactive'),
+                allPackages: fsSettings.packages
+              }
+            : {}),
+          ...(Array.isArray(fsSettings.services) && fsSettings.services.length > 0
+            ? {
+                services: fsSettings.services.filter((s) => s.isPublished !== false),
+                allServices: fsSettings.services
+              }
+            : {}),
+          ...(Array.isArray(fsSettings.currencies) && fsSettings.currencies.length > 0
+            ? {
+                currencies: fsSettings.currencies.filter((c) => c.status !== 'inactive'),
+                allCurrencies: fsSettings.currencies
+              }
+            : {}),
+          ...(fsSettings.pricingConfig ? { pricingConfig: fsSettings.pricingConfig } : {}),
+          ...(fsSettings.autoRateEngine ? { autoRateEngine: fsSettings.autoRateEngine } : {}),
+          ...(fsSettings.emailTemplates ? { emailTemplates: fsSettings.emailTemplates } : {}),
+          updatedAt: new Date(fsMs).toISOString(),
+          updatedAtMillis: fsMs
+        };
+        try {
+          localStorage.setItem('adpulse_config_cache', JSON.stringify(next));
+        } catch {}
+        syncDocumentHead(next);
+        return next;
+      });
+    });
 
     // Verify Paystack redirect callback if user returned from hosted checkout.paystack.com
     const params = new URLSearchParams(window.location.search);
@@ -107,8 +182,21 @@ export default function App() {
     const interval = setInterval(() => {
       loadData(true);
     }, 45000);
-    return () => clearInterval(interval);
+    return () => {
+      clearInterval(interval);
+      unsubSettings();
+      window.removeEventListener('adpulse-config-updated', onLocalConfigUpdated);
+      window.removeEventListener('adpulse-orders-updated', onLocalOrdersUpdated);
+    };
   }, []);
+
+  useEffect(() => {
+    if (!currentUser?.email) return;
+    const unsubOrders = subscribeOrdersFromFirestore(() => {
+      api.getOrders().then(setOrders).catch(() => {});
+    }, currentUser.email);
+    return () => unsubOrders();
+  }, [currentUser?.email]);
 
   const showNotification = (message: string, type: 'success' | 'info' = 'success') => {
     setNotification({ type, message });

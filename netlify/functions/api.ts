@@ -46,6 +46,7 @@ interface NetlifyDb {
   brevoConfig: BrevoConfig;
   emailTemplates: EmailTemplatesConfig;
   emailLogs: EmailLog[];
+  updatedAt?: string;
 }
 
 function getDefaultDb(): NetlifyDb {
@@ -269,7 +270,8 @@ function getDefaultDb(): NetlifyDb {
       adminNotifyEmail: 'baffourgideon05@gmail.com'
     },
     emailTemplates: JSON.parse(JSON.stringify(DEFAULT_EMAIL_TEMPLATES)),
-    emailLogs: []
+    emailLogs: [],
+    updatedAt: '2026-01-01T00:00:00.000Z'
   };
 }
 
@@ -287,10 +289,15 @@ function readDb(): NetlifyDb {
   return memoryDb;
 }
 
-function saveDb(db: NetlifyDb) {
+function saveDb(db: NetlifyDb, bumpUpdatedAt = false) {
+  if (bumpUpdatedAt) {
+    db.updatedAt = new Date().toISOString();
+  }
   memoryDb = db;
   try {
-    fs.writeFileSync(TMP_STORE_PATH, JSON.stringify(db, null, 2));
+    const tmp = `${TMP_STORE_PATH}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
+    fs.renameSync(tmp, TMP_STORE_PATH);
   } catch {}
 }
 
@@ -426,7 +433,8 @@ export default async (req: Request): Promise<Response> => {
         autoRateEngine: db.autoRateEngine,
         paystackPublicKey: db.paystackConfig.publicKey || process.env.VITE_PAYSTACK_PUBLIC_KEY || 'pk_live_93621f2292fc2f1396ddc18fea182881a6f55e1b',
         brevoConfigured: Boolean(effectiveBrevoKey && db.brevoConfig.isEnabled),
-        emailTemplates: db.emailTemplates
+        emailTemplates: db.emailTemplates,
+        updatedAt: db.updatedAt || '2026-01-01T00:00:00.000Z'
       });
     }
 
@@ -761,26 +769,41 @@ export default async (req: Request): Promise<Response> => {
         adminOrderAlert: { ...db.emailTemplates.adminOrderAlert, ...(body.adminOrderAlert || {}) },
         passwordReset: { ...db.emailTemplates.passwordReset, ...(body.passwordReset || {}) }
       };
-      saveDb(db);
-      return jsonResponse({ success: true, emailTemplates: db.emailTemplates });
+      saveDb(db, true);
+      return jsonResponse({ success: true, emailTemplates: db.emailTemplates, updatedAt: db.updatedAt });
     }
 
     // 6. Admin Site Settings, Packages, Currencies & Users
+    if (req.method === 'POST' && apiPath === '/api/admin/restore-config') {
+      if (body.branding) db.branding = { ...db.branding, ...body.branding };
+      if (body.footerConfig) db.footerConfig = { ...db.footerConfig, ...body.footerConfig };
+      if (body.content) db.content = { ...db.content, ...body.content };
+      if (Array.isArray(body.packages) && body.packages.length > 0) db.packages = body.packages;
+      if (Array.isArray(body.services) && body.services.length > 0) db.services = body.services;
+      if (Array.isArray(body.currencies) && body.currencies.length > 0) db.currencies = body.currencies;
+      if (body.pricingConfig) db.pricingConfig = { ...db.pricingConfig, ...body.pricingConfig };
+      if (body.autoRateEngine) db.autoRateEngine = { ...db.autoRateEngine, ...body.autoRateEngine };
+      if (body.emailTemplates) db.emailTemplates = { ...db.emailTemplates, ...body.emailTemplates };
+      db.updatedAt = body.updatedAt || new Date().toISOString();
+      saveDb(db);
+      return jsonResponse({ success: true, updatedAt: db.updatedAt });
+    }
+
     if (req.method === 'POST' && apiPath === '/api/admin/branding') {
       db.branding = { ...db.branding, ...body };
-      saveDb(db);
-      return jsonResponse({ success: true, branding: db.branding });
+      saveDb(db, true);
+      return jsonResponse({ success: true, branding: db.branding, updatedAt: db.updatedAt });
     }
 
     if (req.method === 'POST' && apiPath === '/api/admin/footer') {
       db.footerConfig = { ...db.footerConfig, ...body };
-      saveDb(db);
-      return jsonResponse({ success: true, footerConfig: db.footerConfig });
+      saveDb(db, true);
+      return jsonResponse({ success: true, footerConfig: db.footerConfig, updatedAt: db.updatedAt });
     }
 
     if (req.method === 'POST' && apiPath === '/api/admin/content') {
       db.content = { ...db.content, ...body };
-      saveDb(db);
+      saveDb(db, true);
       return jsonResponse(db.content);
     }
 
@@ -788,21 +811,55 @@ export default async (req: Request): Promise<Response> => {
       const idx = db.packages.findIndex(p => p.id === body.id);
       if (idx >= 0) db.packages[idx] = body;
       else db.packages.push({ ...body, id: body.id || `pkg-${Date.now()}` });
-      saveDb(db);
+      saveDb(db, true);
       return jsonResponse(db.packages);
     }
 
     if (req.method === 'DELETE' && apiPath.startsWith('/api/admin/packages/')) {
       const id = decodeURIComponent(apiPath.replace('/api/admin/packages/', ''));
       db.packages = db.packages.filter(p => p.id !== id);
-      saveDb(db);
-      return jsonResponse(db.packages);
+      saveDb(db, true);
+      return jsonResponse({ success: true, packages: db.packages, updatedAt: db.updatedAt });
+    }
+
+    if (req.method === 'POST' && apiPath === '/api/admin/services') {
+      const idx = db.services.findIndex(s => s.id === body.id);
+      if (idx >= 0) db.services[idx] = body;
+      else db.services.push({ ...body, id: body.id || `srv-${Date.now()}` });
+      saveDb(db, true);
+      return jsonResponse(db.services);
     }
 
     if (req.method === 'POST' && apiPath === '/api/admin/pricing') {
       db.pricingConfig = { ...db.pricingConfig, ...body };
-      saveDb(db);
+      saveDb(db, true);
       return jsonResponse(db.pricingConfig);
+    }
+
+    if (req.method === 'POST' && apiPath.startsWith('/api/admin/currencies/')) {
+      const code = decodeURIComponent(apiPath.replace('/api/admin/currencies/', ''));
+      const curr = db.currencies.find(c => c.code === code);
+      if (!curr) return jsonResponse({ error: 'Currency not found' }, 404);
+      if (body.marginPercent !== undefined) curr.marginPercent = Number(body.marginPercent);
+      if (body.supportedForPayment !== undefined) curr.supportedForPayment = Boolean(body.supportedForPayment);
+      if (body.rateVsUSD && Number(body.rateVsUSD) > 0) {
+        curr.previousRateVsUSD = curr.rateVsUSD;
+        curr.rateVsUSD = Number(body.rateVsUSD);
+        curr.lastUpdated = new Date().toISOString();
+      }
+      saveDb(db, true);
+      return jsonResponse({ currency: curr, updatedAt: db.updatedAt });
+    }
+
+    if (req.method === 'POST' && apiPath.startsWith('/api/orders/') && apiPath.endsWith('/brief')) {
+      const id = decodeURIComponent(apiPath.replace('/api/orders/', '').replace('/brief', ''));
+      const order = db.orders.find(o => o.id === id);
+      if (!order) return jsonResponse({ error: 'Order not found' }, 404);
+      order.campaignBrief = { ...order.campaignBrief, ...body };
+      if (order.campaignStatus === 'DRAFT') order.campaignStatus = 'SUBMITTED';
+      order.updatedAt = new Date().toISOString();
+      saveDb(db);
+      return jsonResponse(order);
     }
 
     if (req.method === 'GET' && apiPath === '/api/admin/users') {

@@ -19,7 +19,13 @@ import {
 import { DEFAULT_EMAIL_TEMPLATES } from '../server/emailTemplates.ts';
 import {
   loadSiteSettingsFromFirestore,
-  saveSiteSettingsToFirestore
+  saveSiteSettingsToFirestore,
+  saveOrderToFirestore,
+  updateOrderBriefInFirestore,
+  fetchOrdersFromFirestore,
+  syncUserProfileToFirestore,
+  fetchUsersFromFirestore,
+  timestampToMillis
 } from '../firebase.ts';
 
 export interface PlatformConfigResponse {
@@ -38,6 +44,8 @@ export interface PlatformConfigResponse {
   emailTemplates?: EmailTemplatesConfig;
   paystackPublicKey: string;
   brevoConfigured?: boolean;
+  updatedAt?: string;
+  updatedAtMillis?: number;
 }
 
 export interface PricingCalculationResult {
@@ -362,7 +370,9 @@ const FALLBACK_CONFIG: PlatformConfigResponse = {
   },
   emailTemplates: DEFAULT_EMAIL_TEMPLATES,
   paystackPublicKey: 'pk_live_93621f2292fc2f1396ddc18fea182881a6f55e1b',
-  brevoConfigured: false
+  brevoConfigured: false,
+  updatedAt: '2026-01-01T00:00:00.000Z',
+  updatedAtMillis: 1767225600000
 };
 
 const FALLBACK_ORDERS: Order[] = [];
@@ -405,22 +415,44 @@ function scrubOrders(orders: Order[]): Order[] {
   );
 }
 
-function updateConfigCache(partial: Partial<PlatformConfigResponse>) {
-  try {
-    const existingRaw = localStorage.getItem('adpulse_config_cache');
-    const base: PlatformConfigResponse = existingRaw ? scrubCachedConfig(JSON.parse(existingRaw)) : FALLBACK_CONFIG;
-    const merged = scrubCachedConfig({ ...base, ...partial });
-    localStorage.setItem('adpulse_config_cache', JSON.stringify(merged));
-    return merged;
-  } catch {
-    return scrubCachedConfig({ ...FALLBACK_CONFIG, ...partial });
+function notifyConfigListeners(cfg: PlatformConfigResponse) {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('adpulse-config-updated', { detail: cfg }));
   }
 }
 
-async function syncConfigSnapshotToFirestore(partial: Partial<PlatformConfigResponse>): Promise<void> {
-  const merged = updateConfigCache(partial);
+function notifyOrdersListeners() {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('adpulse-orders-updated'));
+  }
+}
+
+function updateConfigCache(partial: Partial<PlatformConfigResponse>, explicitTimestamp?: string) {
+  const isoTs = explicitTimestamp || new Date().toISOString();
+  const ms = timestampToMillis(isoTs) || Date.now();
   try {
-    await saveSiteSettingsToFirestore({
+    const existingRaw = localStorage.getItem('adpulse_config_cache');
+    const base: PlatformConfigResponse = existingRaw ? scrubCachedConfig(JSON.parse(existingRaw)) : FALLBACK_CONFIG;
+    const merged = scrubCachedConfig({
+      ...base,
+      ...partial,
+      updatedAt: isoTs,
+      updatedAtMillis: ms
+    });
+    localStorage.setItem('adpulse_config_cache', JSON.stringify(merged));
+    notifyConfigListeners(merged);
+    return merged;
+  } catch {
+    const fallbackMerged = scrubCachedConfig({ ...FALLBACK_CONFIG, ...partial, updatedAt: isoTs, updatedAtMillis: ms });
+    notifyConfigListeners(fallbackMerged);
+    return fallbackMerged;
+  }
+}
+
+async function syncConfigSnapshotToFirestore(partial: Partial<PlatformConfigResponse>, explicitTimestamp?: string): Promise<boolean> {
+  const merged = updateConfigCache(partial, explicitTimestamp);
+  try {
+    const res = await saveSiteSettingsToFirestore({
       branding: merged.branding,
       footerConfig: merged.footerConfig,
       content: merged.content,
@@ -431,8 +463,10 @@ async function syncConfigSnapshotToFirestore(partial: Partial<PlatformConfigResp
       autoRateEngine: merged.autoRateEngine,
       emailTemplates: merged.emailTemplates || DEFAULT_EMAIL_TEMPLATES
     });
+    return res.synced;
   } catch (err) {
-    console.warn('Firestore background sync deferred (sign in with Admin Google account to sync directly to Cloud Firestore):', err);
+    console.warn('Firestore background sync deferred (connect Admin Google account to sync directly to Cloud Firestore):', err);
+    return false;
   }
 }
 
@@ -457,35 +491,93 @@ export const api = {
     }
 
     const fsSettings = await loadSiteSettingsFromFirestore();
-    const base = serverConfig || this.getCachedOrFallbackConfig();
+    const cached = this.getCachedOrFallbackConfig();
 
-    const merged: PlatformConfigResponse = scrubCachedConfig({
-      ...base,
-      ...(fsSettings?.branding ? { branding: fsSettings.branding } : {}),
-      ...(fsSettings?.footerConfig ? { footerConfig: fsSettings.footerConfig } : {}),
-      ...(fsSettings?.content ? { content: { ...base.content, ...fsSettings.content } } : {}),
-      ...(Array.isArray(fsSettings?.packages) && fsSettings.packages.length > 0
-        ? {
-            packages: fsSettings.packages.filter((p) => p.status !== 'inactive'),
-            allPackages: fsSettings.packages
-          }
-        : {}),
-      ...(Array.isArray(fsSettings?.services) && fsSettings.services.length > 0
-        ? {
-            services: fsSettings.services.filter((s) => s.isPublished !== false),
-            allServices: fsSettings.services
-          }
-        : {}),
-      ...(Array.isArray(fsSettings?.currencies) && fsSettings.currencies.length > 0
-        ? {
-            currencies: fsSettings.currencies.filter((c) => c.status !== 'inactive'),
-            allCurrencies: fsSettings.currencies
-          }
-        : {}),
-      ...(fsSettings?.pricingConfig ? { pricingConfig: fsSettings.pricingConfig } : {}),
-      ...(fsSettings?.autoRateEngine ? { autoRateEngine: fsSettings.autoRateEngine } : {}),
-      ...(fsSettings?.emailTemplates ? { emailTemplates: fsSettings.emailTemplates } : {})
-    });
+    const serverTime = timestampToMillis(serverConfig?.updatedAt);
+    const fsTime = fsSettings?.updatedAtMillis || 0;
+    const cachedTime = cached.updatedAtMillis || timestampToMillis(cached.updatedAt);
+
+    let merged: PlatformConfigResponse;
+
+    if (fsSettings && fsTime > serverTime) {
+      // Cloud Firestore has newer edits (e.g. ephemeral backend restart or fresh deploy)
+      const base = serverConfig || cached;
+      merged = scrubCachedConfig({
+        ...base,
+        ...(fsSettings.branding ? { branding: fsSettings.branding } : {}),
+        ...(fsSettings.footerConfig ? { footerConfig: fsSettings.footerConfig } : {}),
+        ...(fsSettings.content ? { content: { ...base.content, ...fsSettings.content } } : {}),
+        ...(Array.isArray(fsSettings.packages) && fsSettings.packages.length > 0
+          ? {
+              packages: fsSettings.packages.filter((p) => p.status !== 'inactive'),
+              allPackages: fsSettings.packages
+            }
+          : {}),
+        ...(Array.isArray(fsSettings.services) && fsSettings.services.length > 0
+          ? {
+              services: fsSettings.services.filter((s) => s.isPublished !== false),
+              allServices: fsSettings.services
+            }
+          : {}),
+        ...(Array.isArray(fsSettings.currencies) && fsSettings.currencies.length > 0
+          ? {
+              currencies: fsSettings.currencies.filter((c) => c.status !== 'inactive'),
+              allCurrencies: fsSettings.currencies
+            }
+          : {}),
+        ...(fsSettings.pricingConfig ? { pricingConfig: fsSettings.pricingConfig } : {}),
+        ...(fsSettings.autoRateEngine ? { autoRateEngine: fsSettings.autoRateEngine } : {}),
+        ...(fsSettings.emailTemplates ? { emailTemplates: fsSettings.emailTemplates } : {}),
+        updatedAt: new Date(fsTime).toISOString(),
+        updatedAtMillis: fsTime
+      });
+
+      // Automatically hydrate fresh server instance from Firestore snapshot
+      if (serverConfig && serverTime < fsTime) {
+        fetch('/api/admin/restore-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            branding: merged.branding,
+            footerConfig: merged.footerConfig,
+            content: merged.content,
+            packages: merged.allPackages,
+            services: merged.allServices,
+            currencies: merged.allCurrencies,
+            pricingConfig: merged.pricingConfig,
+            autoRateEngine: merged.autoRateEngine,
+            emailTemplates: merged.emailTemplates,
+            updatedAt: merged.updatedAt
+          })
+        }).catch(() => {});
+      }
+    } else if (serverConfig) {
+      // Backend server is newer than or equal to Firestore — NEVER let stale Firestore overwrite fresh server edits
+      merged = scrubCachedConfig({
+        ...serverConfig,
+        updatedAtMillis: serverTime || Date.now()
+      });
+
+      // If Firestore had older edits and Google Admin is currently signed in, sync Firestore forward automatically
+      if (serverTime > fsTime) {
+        saveSiteSettingsToFirestore({
+          branding: merged.branding,
+          footerConfig: merged.footerConfig,
+          content: merged.content,
+          packages: merged.allPackages || merged.packages,
+          services: merged.allServices || merged.services,
+          currencies: merged.allCurrencies || merged.currencies,
+          pricingConfig: merged.pricingConfig,
+          autoRateEngine: merged.autoRateEngine,
+          emailTemplates: merged.emailTemplates || DEFAULT_EMAIL_TEMPLATES
+        }).catch(() => {});
+      }
+    } else {
+      merged = scrubCachedConfig({
+        ...cached,
+        updatedAtMillis: cachedTime
+      });
+    }
 
     try {
       localStorage.setItem('adpulse_config_cache', JSON.stringify(merged));
@@ -541,7 +633,10 @@ export const api = {
         body: JSON.stringify(profile)
       });
       const data = await res.json();
-      if (res.ok) return data;
+      if (res.ok) {
+        syncUserProfileToFirestore(data.user).catch(() => {});
+        return data;
+      }
     } catch (e) {
       console.warn('Network Google login failed, verifying identity strictly against admin email', e);
     }
@@ -558,6 +653,7 @@ export const api = {
       status: 'active',
       createdAt: new Date().toISOString()
     };
+    syncUserProfileToFirestore(user).catch(() => {});
     return { success: true, user, isAdmin };
   },
 
@@ -654,55 +750,61 @@ export const api = {
   },
 
   async createOrder(payload: any): Promise<Order> {
+    let created: Order | null = null;
     try {
       const res = await fetch('/api/orders', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      if (res.ok) return res.json();
+      if (res.ok) created = await res.json();
     } catch {}
 
-    const orderId = `ORD-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
-    const calc = await this.calculatePrice({
-      serviceId: payload.serviceId,
-      packageId: payload.packageId,
-      adBudgetUSD: payload.adBudgetUSD,
-      fundingArrangement: payload.fundingArrangement,
-      targetCurrency: payload.paymentCurrency
-    });
+    if (!created) {
+      const orderId = `ORD-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
+      const calc = await this.calculatePrice({
+        serviceId: payload.serviceId,
+        packageId: payload.packageId,
+        adBudgetUSD: payload.adBudgetUSD,
+        fundingArrangement: payload.fundingArrangement,
+        targetCurrency: payload.paymentCurrency
+      });
 
-    const newOrder: Order = {
-      id: orderId,
-      customerId: payload.customerId || `usr-${Date.now()}`,
-      customerEmail: payload.customerEmail,
-      customerName: payload.customerName,
-      customerPhone: payload.customerPhone || '',
-      serviceId: calc.service.id,
-      serviceName: calc.service.name,
-      packageId: calc.package?.id,
-      packageName: calc.package?.name,
-      fundingArrangement: calc.fundingArrangement,
-      pricingCurrency: 'USD',
-      adBudgetUSD: calc.base.adBudgetUSD,
-      agencyFeeUSD: calc.base.agencyFeeUSD,
-      taxUSD: 0,
-      totalUSD: calc.base.totalUSD,
-      paymentCurrency: calc.converted.currency,
-      appliedExchangeRate: calc.converted.effectiveRate,
-      exchangeRateMarginPercent: calc.converted.marginPercent,
-      paymentAdBudget: calc.converted.paymentAdBudget,
-      paymentAgencyFee: calc.converted.paymentAgencyFee,
-      paymentTax: 0,
-      paymentTotal: calc.converted.paymentTotal,
-      rateSnapshot: calc.snapshot,
-      paymentStatus: 'PENDING',
-      campaignBrief: payload.campaignBrief,
-      campaignStatus: 'DRAFT',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
-    return newOrder;
+      created = {
+        id: orderId,
+        customerId: payload.customerId || `usr-${Date.now()}`,
+        customerEmail: payload.customerEmail,
+        customerName: payload.customerName,
+        customerPhone: payload.customerPhone || '',
+        serviceId: calc.service.id,
+        serviceName: calc.service.name,
+        packageId: calc.package?.id,
+        packageName: calc.package?.name,
+        fundingArrangement: calc.fundingArrangement,
+        pricingCurrency: 'USD',
+        adBudgetUSD: calc.base.adBudgetUSD,
+        agencyFeeUSD: calc.base.agencyFeeUSD,
+        taxUSD: 0,
+        totalUSD: calc.base.totalUSD,
+        paymentCurrency: calc.converted.currency,
+        appliedExchangeRate: calc.converted.effectiveRate,
+        exchangeRateMarginPercent: calc.converted.marginPercent,
+        paymentAdBudget: calc.converted.paymentAdBudget,
+        paymentAgencyFee: calc.converted.paymentAgencyFee,
+        paymentTax: 0,
+        paymentTotal: calc.converted.paymentTotal,
+        rateSnapshot: calc.snapshot,
+        paymentStatus: 'PENDING',
+        campaignBrief: payload.campaignBrief,
+        campaignStatus: 'DRAFT',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+    }
+
+    saveOrderToFirestore(created).catch(() => {});
+    notifyOrdersListeners();
+    return created;
   },
 
   async initializePaystack(orderId: string): Promise<any> {
@@ -725,20 +827,42 @@ export const api = {
     if (!res.ok || !data.verified) {
       throw new Error(data.error || 'Paystack transaction verification failed.');
     }
+    if (data.order) {
+      saveOrderToFirestore(data.order).catch(() => {});
+      notifyOrdersListeners();
+    }
     return data;
   },
 
   async getOrders(email?: string): Promise<Order[]> {
+    let serverOrders: Order[] = [];
     try {
       const url = email ? `/api/orders?email=${encodeURIComponent(email)}` : '/api/orders';
       const res = await fetch(url);
       if (res.ok) {
-        const cleaned = scrubOrders(await res.json());
-        try { localStorage.setItem('adpulse_orders_cache', JSON.stringify(cleaned)); } catch {}
-        return cleaned;
+        serverOrders = scrubOrders(await res.json());
       }
     } catch (e) {
-      console.warn('Network /api/orders failed, checking cache', e);
+      console.warn('Network /api/orders failed, checking Firestore/cache', e);
+    }
+
+    const fsOrders = scrubOrders(await fetchOrdersFromFirestore(email));
+
+    if (serverOrders.length > 0 || fsOrders.length > 0) {
+      const byId = new Map<string, Order>();
+      for (const o of [...fsOrders, ...serverOrders]) {
+        const existing = byId.get(o.id);
+        if (!existing || timestampToMillis(o.updatedAt) >= timestampToMillis(existing.updatedAt)) {
+          byId.set(o.id, o);
+        }
+      }
+      const merged = Array.from(byId.values()).sort(
+        (a, b) => timestampToMillis(b.createdAt) - timestampToMillis(a.createdAt)
+      );
+      try {
+        localStorage.setItem('adpulse_orders_cache', JSON.stringify(merged));
+      } catch {}
+      return merged;
     }
 
     try {
@@ -770,15 +894,26 @@ export const api = {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || 'Failed to update campaign brief.');
+    updateOrderBriefInFirestore(id, brief).catch(() => {});
+    notifyOrdersListeners();
     return data;
   },
 
   // --- Admin APIs ---
   async adminGetUsers(): Promise<UserAccount[]> {
+    let serverUsers: UserAccount[] = [];
     try {
       const res = await fetch('/api/admin/users');
-      if (res.ok) return res.json();
+      if (res.ok) serverUsers = await res.json();
     } catch {}
+    const fsUsers = await fetchUsersFromFirestore();
+    if (serverUsers.length > 0 || fsUsers.length > 0) {
+      const byEmail = new Map<string, UserAccount>();
+      for (const u of [...fsUsers, ...serverUsers]) {
+        if (u.email) byEmail.set(u.email.toLowerCase(), u);
+      }
+      return Array.from(byEmail.values());
+    }
     return [
       { id: 'usr-admin-gideon', email: 'baffourgideon05@gmail.com', name: 'Gideon Baffour', role: 'admin', authProvider: 'email', status: 'active', createdAt: '2026-01-01T00:00:00.000Z' }
     ];
@@ -810,8 +945,48 @@ export const api = {
     return res.json().catch(() => ({ success: true }));
   },
 
-  async adminUpdateBranding(branding: Partial<SiteBranding>): Promise<{ success: boolean; branding: SiteBranding }> {
-    let result = { success: true, branding: { ...this.getCachedOrFallbackConfig().branding, ...branding } };
+  async adminSaveSiteBrandingAndContent(
+    branding: Partial<SiteBranding>,
+    content: Partial<WebsiteContent>
+  ): Promise<{ success: boolean; branding: SiteBranding; content: WebsiteContent; cloudSynced: boolean }> {
+    let updatedBranding = { ...this.getCachedOrFallbackConfig().branding, ...branding };
+    let updatedContent = { ...this.getCachedOrFallbackConfig().content, ...content };
+    let updatedAt: string | undefined;
+
+    try {
+      const resBranding = await fetch('/api/admin/branding', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(branding)
+      });
+      if (resBranding.ok) {
+        const bJson = await resBranding.json();
+        if (bJson.branding) updatedBranding = bJson.branding;
+        if (bJson.updatedAt) updatedAt = bJson.updatedAt;
+      }
+    } catch {}
+
+    try {
+      const resContent = await fetch('/api/admin/content', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(content)
+      });
+      if (resContent.ok) {
+        updatedContent = await resContent.json();
+        updatedAt = new Date().toISOString();
+      }
+    } catch {}
+
+    const cloudSynced = await syncConfigSnapshotToFirestore(
+      { branding: updatedBranding, content: updatedContent },
+      updatedAt
+    );
+    return { success: true, branding: updatedBranding, content: updatedContent, cloudSynced };
+  },
+
+  async adminUpdateBranding(branding: Partial<SiteBranding>): Promise<{ success: boolean; branding: SiteBranding; cloudSynced?: boolean }> {
+    let result: any = { success: true, branding: { ...this.getCachedOrFallbackConfig().branding, ...branding } };
     try {
       const res = await fetch('/api/admin/branding', {
         method: 'POST',
@@ -820,12 +995,12 @@ export const api = {
       });
       if (res.ok) result = await res.json();
     } catch {}
-    await syncConfigSnapshotToFirestore({ branding: result.branding });
-    return result;
+    const cloudSynced = await syncConfigSnapshotToFirestore({ branding: result.branding }, result.updatedAt);
+    return { ...result, cloudSynced };
   },
 
-  async adminUpdateFooter(footer: Partial<FooterConfig>): Promise<{ success: boolean; footerConfig: FooterConfig }> {
-    let result = { success: true, footerConfig: { ...this.getCachedOrFallbackConfig().footerConfig, ...footer } };
+  async adminUpdateFooter(footer: Partial<FooterConfig>): Promise<{ success: boolean; footerConfig: FooterConfig; cloudSynced?: boolean }> {
+    let result: any = { success: true, footerConfig: { ...this.getCachedOrFallbackConfig().footerConfig, ...footer } };
     try {
       const res = await fetch('/api/admin/footer', {
         method: 'POST',
@@ -834,8 +1009,8 @@ export const api = {
       });
       if (res.ok) result = await res.json();
     } catch {}
-    await syncConfigSnapshotToFirestore({ footerConfig: result.footerConfig });
-    return result;
+    const cloudSynced = await syncConfigSnapshotToFirestore({ footerConfig: result.footerConfig }, result.updatedAt);
+    return { ...result, cloudSynced };
   },
 
   async adminTriggerAutoRate(): Promise<any> {
@@ -847,15 +1022,17 @@ export const api = {
   },
 
   async adminUpdateAutoRateConfig(config: Partial<AutoRateEngineConfig>): Promise<any> {
+    let result: any = { success: true, autoRateEngine: { ...this.getCachedOrFallbackConfig().autoRateEngine, ...config } };
     try {
       const res = await fetch('/api/admin/auto-rate/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(config)
       });
-      if (res.ok) return res.json();
+      if (res.ok) result = await res.json();
     } catch {}
-    return { success: true };
+    await syncConfigSnapshotToFirestore({ autoRateEngine: result.autoRateEngine || { ...this.getCachedOrFallbackConfig().autoRateEngine, ...config } }, result.updatedAt);
+    return result;
   },
 
   async adminUpdateOrder(id: string, update: any): Promise<Order> {
@@ -866,6 +1043,8 @@ export const api = {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || 'Failed to update order.');
+    saveOrderToFirestore(data).catch(() => {});
+    notifyOrdersListeners();
     return data;
   },
 
@@ -880,18 +1059,27 @@ export const api = {
       if (res.ok) result = await res.json();
     } catch {}
     const current = this.getCachedOrFallbackConfig().allCurrencies;
-    const updatedCurrencies = current.map((c) => (c.code === code ? { ...c, ...payload } : c));
-    await syncConfigSnapshotToFirestore({
+    const updatedCurrencies = current.map((c) => (c.code === code ? { ...c, ...payload, ...(result.currency || {}) } : c));
+    const cloudSynced = await syncConfigSnapshotToFirestore({
       allCurrencies: updatedCurrencies,
       currencies: updatedCurrencies.filter((c) => c.status !== 'inactive')
-    });
-    return result;
+    }, result.updatedAt);
+    return { ...result, cloudSynced };
   },
 
   async adminSyncCurrencies(): Promise<any> {
     try {
       const res = await fetch('/api/admin/currencies/sync', { method: 'POST' });
-      if (res.ok) return res.json();
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.currencies)) {
+          await syncConfigSnapshotToFirestore({
+            allCurrencies: data.currencies,
+            currencies: data.currencies.filter((c: Currency) => c.status !== 'inactive')
+          });
+        }
+        return data;
+      }
     } catch {}
     return { success: true, currencies: DEFAULT_CURRENCIES, detections: [] };
   },
@@ -946,19 +1134,22 @@ export const api = {
 
   async adminDeletePackage(id: string): Promise<AdvertisingPackage[]> {
     let list = this.getCachedOrFallbackConfig().allPackages.filter((p) => p.id !== id);
+    let updatedAt: string | undefined;
     try {
       const res = await fetch(`/api/admin/packages/${encodeURIComponent(id)}`, {
         method: 'DELETE'
       });
       if (res.ok) {
         const data = await res.json();
-        if (Array.isArray(data.packages)) list = data.packages;
+        if (Array.isArray(data)) list = data;
+        else if (Array.isArray(data.packages)) list = data.packages;
+        if (data.updatedAt) updatedAt = data.updatedAt;
       }
     } catch {}
     await syncConfigSnapshotToFirestore({
       allPackages: list,
       packages: list.filter((p) => p.status !== 'inactive')
-    });
+    }, updatedAt);
     return list;
   },
 
@@ -976,8 +1167,8 @@ export const api = {
     return result;
   },
 
-  async adminUpdateEmailTemplates(emailTemplates: EmailTemplatesConfig): Promise<{ success: boolean; emailTemplates: EmailTemplatesConfig }> {
-    let result = { success: true, emailTemplates };
+  async adminUpdateEmailTemplates(emailTemplates: EmailTemplatesConfig): Promise<{ success: boolean; emailTemplates: EmailTemplatesConfig; cloudSynced?: boolean }> {
+    let result: any = { success: true, emailTemplates };
     try {
       const res = await fetch('/api/admin/email-templates', {
         method: 'POST',
@@ -986,8 +1177,8 @@ export const api = {
       });
       if (res.ok) result = await res.json();
     } catch {}
-    await syncConfigSnapshotToFirestore({ emailTemplates: result.emailTemplates });
-    return result;
+    const cloudSynced = await syncConfigSnapshotToFirestore({ emailTemplates: result.emailTemplates }, result.updatedAt);
+    return { ...result, cloudSynced };
   },
 
   // --- Admin Integrations (Paystack & Brevo) ---

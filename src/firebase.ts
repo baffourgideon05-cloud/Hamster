@@ -11,9 +11,17 @@ import {
   getFirestore,
   doc,
   getDoc,
+  getDocs,
   getDocFromServer,
   setDoc,
-  serverTimestamp
+  updateDoc,
+  collection,
+  query,
+  where,
+  onSnapshot,
+  serverTimestamp,
+  Timestamp,
+  Unsubscribe
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 import {
@@ -25,7 +33,9 @@ import {
   Currency,
   PricingConfig,
   AutoRateEngineConfig,
-  EmailTemplatesConfig
+  EmailTemplatesConfig,
+  Order,
+  UserAccount
 } from './types/index.ts';
 
 // Initialize Firebase App & Named Firestore Database
@@ -230,6 +240,41 @@ export async function sendEmailViaGmail(params: {
   return { success: true, id: data.id };
 }
 
+function stripUndefined<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((item) => stripUndefined(item)) as unknown as T;
+  }
+  if (value !== null && typeof value === 'object') {
+    if (value instanceof Timestamp) return value;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (v !== undefined) {
+        out[k] = stripUndefined(v);
+      }
+    }
+    return out as T;
+  }
+  return value;
+}
+
+export function timestampToMillis(val: unknown): number {
+  if (!val) return 0;
+  if (val instanceof Timestamp) return val.toMillis();
+  if (typeof val === 'object' && val !== null && 'seconds' in val && typeof (val as any).seconds === 'number') {
+    return (val as any).seconds * 1000 + Math.floor(((val as any).nanoseconds || 0) / 1e6);
+  }
+  if (typeof val === 'string' || typeof val === 'number') {
+    const ms = new Date(val).getTime();
+    return Number.isFinite(ms) ? ms : 0;
+  }
+  return 0;
+}
+
+export function timestampToIso(val: unknown, fallback = new Date().toISOString()): string {
+  const ms = timestampToMillis(val);
+  return ms > 0 ? new Date(ms).toISOString() : fallback;
+}
+
 export interface FirestoreSiteSettings {
   branding: SiteBranding;
   footerConfig: FooterConfig;
@@ -241,17 +286,46 @@ export interface FirestoreSiteSettings {
   autoRateEngine?: AutoRateEngineConfig;
   emailTemplates?: EmailTemplatesConfig;
   updatedAt?: unknown;
+  updatedAtMillis?: number;
 }
 
 export async function loadSiteSettingsFromFirestore(): Promise<FirestoreSiteSettings | null> {
   try {
     const snap = await getDoc(doc(db, 'site_settings', 'public'));
     if (!snap.exists()) return null;
-    return snap.data() as FirestoreSiteSettings;
+    const data = snap.data() as FirestoreSiteSettings;
+    return {
+      ...data,
+      updatedAtMillis: timestampToMillis(data.updatedAt)
+    };
   } catch (err) {
     console.warn('Firestore site_settings/public load warning:', err);
     return null;
   }
+}
+
+export function subscribeSiteSettings(
+  onData: (settings: FirestoreSiteSettings) => void,
+  onError?: (err: unknown) => void
+): Unsubscribe {
+  const path = 'site_settings/public';
+  return onSnapshot(
+    doc(db, 'site_settings', 'public'),
+    (snap) => {
+      if (!snap.exists()) return;
+      const data = snap.data() as FirestoreSiteSettings;
+      onData({
+        ...data,
+        updatedAtMillis: timestampToMillis(data.updatedAt)
+      });
+    },
+    (error) => {
+      if (onError) onError(error);
+      try {
+        handleFirestoreError(error, 'get', path);
+      } catch {}
+    }
+  );
 }
 
 /**
@@ -260,19 +334,19 @@ export async function loadSiteSettingsFromFirestore(): Promise<FirestoreSiteSett
  * Strictly excludes secrets (Paystack secretKey, Brevo apiKey, passwordHashes).
  */
 export async function saveSiteSettingsToFirestore(
-  settings: Omit<FirestoreSiteSettings, 'updatedAt'>
-): Promise<boolean> {
+  settings: Omit<FirestoreSiteSettings, 'updatedAt' | 'updatedAtMillis'>
+): Promise<{ synced: boolean; reason?: string }> {
   const fbUser = auth.currentUser;
   if (!fbUser || !fbUser.emailVerified) {
-    return false;
+    return { synced: false, reason: 'Firebase Google session not connected' };
   }
 
-  // Strictly sanitize payload against firestore.rules bounds & field whitelist
-  const cleanPayload = {
+  // Strictly sanitize payload against firestore.rules bounds & strip all undefined fields
+  const cleanPayload = stripUndefined({
     branding: {
       siteTitle: String(settings.branding.siteTitle || 'AdPulse Global').slice(0, 200),
       siteShortName: String(settings.branding.siteShortName || 'AdPulse Global').slice(0, 100),
-      logoUrl: String(settings.branding.logoUrl || '').slice(0, 1000),
+      logoUrl: String(settings.branding.logoUrl || '').slice(0, 250000),
       logoBadgeText: String(settings.branding.logoBadgeText || 'AP').slice(0, 10),
       adminGoogleEmail: String(settings.branding.adminGoogleEmail || 'baffourgideon05@gmail.com').slice(0, 254)
     },
@@ -298,14 +372,238 @@ export async function saveSiteSettingsToFirestore(
     ...(settings.currencies ? { currencies: settings.currencies.slice(0, 30) } : {}),
     ...(settings.pricingConfig ? { pricingConfig: settings.pricingConfig } : {}),
     ...(settings.autoRateEngine ? { autoRateEngine: settings.autoRateEngine } : {}),
-    ...(settings.emailTemplates ? { emailTemplates: settings.emailTemplates } : {}),
-    updatedAt: serverTimestamp()
-  };
+    ...(settings.emailTemplates ? { emailTemplates: settings.emailTemplates } : {})
+  });
 
   try {
-    await setDoc(doc(db, 'site_settings', 'public'), cleanPayload, { merge: false });
-    return true;
+    await setDoc(
+      doc(db, 'site_settings', 'public'),
+      {
+        ...cleanPayload,
+        updatedAt: serverTimestamp()
+      },
+      { merge: false }
+    );
+    return { synced: true };
   } catch (error) {
     handleFirestoreError(error, 'write', 'site_settings/public');
+  }
+}
+
+// --- Firestore Orders Persistence (Paired with Server Paystack Settlement) ---
+
+function serializeOrderFromFirestore(raw: any): Order {
+  return {
+    ...raw,
+    createdAt: timestampToIso(raw.createdAt),
+    updatedAt: timestampToIso(raw.updatedAt)
+  } as Order;
+}
+
+export async function saveOrderToFirestore(order: Order): Promise<boolean> {
+  const fbUser = auth.currentUser;
+  if (!fbUser || !fbUser.emailVerified) return false;
+
+  const docPath = `orders/${order.id}`;
+  const cleanOrder = stripUndefined({
+    id: String(order.id).slice(0, 128),
+    ownerUid: String((order as any).ownerUid || fbUser.uid).slice(0, 128),
+    customerId: String(order.customerId || fbUser.uid).slice(0, 128),
+    customerEmail: String(order.customerEmail).toLowerCase().slice(0, 254),
+    customerName: String(order.customerName || 'Client').slice(0, 120),
+    customerPhone: String(order.customerPhone || '').slice(0, 40),
+    serviceId: String(order.serviceId || '').slice(0, 80),
+    serviceName: String(order.serviceName || '').slice(0, 160),
+    packageId: order.packageId ? String(order.packageId).slice(0, 80) : undefined,
+    packageName: order.packageName ? String(order.packageName).slice(0, 160) : undefined,
+    fundingArrangement: order.fundingArrangement,
+    pricingCurrency: String(order.pricingCurrency || 'USD').slice(0, 10),
+    adBudgetUSD: Number(order.adBudgetUSD || 0),
+    agencyFeeUSD: Number(order.agencyFeeUSD || 0),
+    taxUSD: Number(order.taxUSD || 0),
+    totalUSD: Number(order.totalUSD || 0),
+    paymentCurrency: String(order.paymentCurrency || 'GHS').slice(0, 10),
+    appliedExchangeRate: Number(order.appliedExchangeRate || 1),
+    exchangeRateMarginPercent: Number(order.exchangeRateMarginPercent || 0),
+    paymentAdBudget: Number(order.paymentAdBudget || 0),
+    paymentAgencyFee: Number(order.paymentAgencyFee || 0),
+    paymentTax: Number(order.paymentTax || 0),
+    paymentTotal: Number(order.paymentTotal || 0),
+    rateSnapshot: order.rateSnapshot,
+    paymentStatus: order.paymentStatus,
+    paymentReference: order.paymentReference,
+    paymentChannel: order.paymentChannel,
+    paidAt: order.paidAt,
+    receiptNumber: order.receiptNumber,
+    campaignBrief: order.campaignBrief
+      ? {
+          businessName: String(order.campaignBrief.businessName || '').slice(0, 160),
+          websiteUrl: order.campaignBrief.websiteUrl ? String(order.campaignBrief.websiteUrl).slice(0, 400) : undefined,
+          platform: order.campaignBrief.platform,
+          objective: order.campaignBrief.objective,
+          targetLocations: order.campaignBrief.targetLocations,
+          targetAge: order.campaignBrief.targetAge,
+          targetInterests: order.campaignBrief.targetInterests,
+          headline: String(order.campaignBrief.headline || '').slice(0, 240),
+          primaryText: String(order.campaignBrief.primaryText || '').slice(0, 1200),
+          callToAction: order.campaignBrief.callToAction,
+          destinationUrl: String(order.campaignBrief.destinationUrl || '').slice(0, 400),
+          facebookPageOrHandle: order.campaignBrief.facebookPageOrHandle,
+          specialInstructions: order.campaignBrief.specialInstructions
+            ? String(order.campaignBrief.specialInstructions).slice(0, 1000)
+            : undefined
+        }
+      : undefined,
+    campaignStatus: order.campaignStatus,
+    assignedStaff: order.assignedStaff,
+    reviewNotes: order.reviewNotes,
+    performance: order.performance
+  });
+
+  try {
+    const existingSnap = await getDoc(doc(db, 'orders', order.id));
+    if (!existingSnap.exists()) {
+      await setDoc(doc(db, 'orders', order.id), {
+        ...cleanOrder,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp()
+      });
+    } else {
+      const existingData = existingSnap.data();
+      await setDoc(doc(db, 'orders', order.id), {
+        ...cleanOrder,
+        ownerUid: existingData.ownerUid || cleanOrder.ownerUid,
+        createdAt: existingData.createdAt || serverTimestamp(),
+        updatedAt: serverTimestamp()
+      });
+    }
+    return true;
+  } catch (error) {
+    handleFirestoreError(error, 'write', docPath);
+  }
+}
+
+export async function updateOrderBriefInFirestore(orderId: string, brief: Record<string, any>): Promise<boolean> {
+  const fbUser = auth.currentUser;
+  if (!fbUser || !fbUser.emailVerified) return false;
+  const docPath = `orders/${orderId}`;
+  try {
+    const snap = await getDoc(doc(db, 'orders', orderId));
+    if (!snap.exists()) return false;
+    await updateDoc(doc(db, 'orders', orderId), {
+      campaignBrief: stripUndefined({ ...(snap.data().campaignBrief || {}), ...brief }),
+      updatedAt: serverTimestamp()
+    });
+    return true;
+  } catch (error) {
+    handleFirestoreError(error, 'update', docPath);
+  }
+}
+
+export async function fetchOrdersFromFirestore(email?: string): Promise<Order[]> {
+  const fbUser = auth.currentUser;
+  if (!fbUser || !fbUser.emailVerified) return [];
+
+  const isAdmin = fbUser.email?.toLowerCase() === 'baffourgideon05@gmail.com';
+  try {
+    const colRef = collection(db, 'orders');
+    const q = isAdmin
+      ? colRef
+      : query(colRef, where('customerEmail', '==', (email || fbUser.email || '').toLowerCase()));
+    const snap = await getDocs(q);
+    return snap.docs.map((d) => serializeOrderFromFirestore(d.data()));
+  } catch (error) {
+    console.warn('Firestore orders fetch warning:', error);
+    return [];
+  }
+}
+
+export function subscribeOrdersFromFirestore(
+  onOrders: (orders: Order[]) => void,
+  email?: string
+): Unsubscribe {
+  const fbUser = auth.currentUser;
+  if (!fbUser || !fbUser.emailVerified) {
+    return () => {};
+  }
+  const isAdmin = fbUser.email?.toLowerCase() === 'baffourgideon05@gmail.com';
+  const colRef = collection(db, 'orders');
+  const q = isAdmin
+    ? colRef
+    : query(colRef, where('customerEmail', '==', (email || fbUser.email || '').toLowerCase()));
+
+  return onSnapshot(
+    q,
+    (snap) => {
+      onOrders(snap.docs.map((d) => serializeOrderFromFirestore(d.data())));
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, 'list', 'orders');
+      } catch {}
+    }
+  );
+}
+
+export async function syncUserProfileToFirestore(user: UserAccount): Promise<boolean> {
+  const fbUser = auth.currentUser;
+  if (!fbUser || !fbUser.emailVerified) return false;
+  const docPath = `users/${fbUser.uid}`;
+  try {
+    const snap = await getDoc(doc(db, 'users', fbUser.uid));
+    if (!snap.exists()) {
+      await setDoc(
+        doc(db, 'users', fbUser.uid),
+        stripUndefined({
+          uid: fbUser.uid,
+          email: (fbUser.email || user.email).toLowerCase().slice(0, 254),
+          name: String(user.name || fbUser.displayName || 'Client').slice(0, 120),
+          phone: String(user.phone || '').slice(0, 40),
+          role: 'customer',
+          authProvider: 'google',
+          avatarUrl: String(user.avatarUrl || fbUser.photoURL || '').slice(0, 500),
+          status: 'active',
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp()
+        })
+      );
+    } else {
+      await updateDoc(doc(db, 'users', fbUser.uid), {
+        name: String(user.name || fbUser.displayName || 'Client').slice(0, 120),
+        avatarUrl: String(user.avatarUrl || fbUser.photoURL || '').slice(0, 500),
+        updatedAt: serverTimestamp()
+      });
+    }
+    return true;
+  } catch (error) {
+    console.warn('User Firestore profile sync notice:', error);
+    return false;
+  }
+}
+
+export async function fetchUsersFromFirestore(): Promise<UserAccount[]> {
+  const fbUser = auth.currentUser;
+  if (!fbUser || !fbUser.emailVerified || fbUser.email?.toLowerCase() !== 'baffourgideon05@gmail.com') {
+    return [];
+  }
+  try {
+    const snap = await getDocs(collection(db, 'users'));
+    return snap.docs.map((d) => {
+      const data = d.data();
+      return {
+        id: data.uid || d.id,
+        email: data.email,
+        name: data.name,
+        phone: data.phone,
+        role: data.role || 'customer',
+        authProvider: data.authProvider || 'google',
+        avatarUrl: data.avatarUrl,
+        status: data.status || 'active',
+        createdAt: timestampToIso(data.createdAt)
+      } as UserAccount;
+    });
+  } catch (error) {
+    console.warn('Firestore users fetch notice:', error);
+    return [];
   }
 }

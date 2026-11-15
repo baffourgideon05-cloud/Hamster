@@ -59,7 +59,7 @@ service cloud.firestore {
         && data.branding.keys().hasOnly(['siteTitle', 'siteShortName', 'logoUrl', 'logoBadgeText', 'adminGoogleEmail'])
         && isValidString(data.branding.siteTitle, 1, 200)
         && isValidString(data.branding.siteShortName, 1, 100)
-        && isValidString(data.branding.logoUrl, 0, 1000)
+        && isValidString(data.branding.logoUrl, 0, 250000)
         && isValidString(data.branding.logoBadgeText, 0, 10)
         && isValidString(data.branding.adminGoogleEmail, 3, 254)
         && data.footerConfig is map
