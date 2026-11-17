@@ -155,6 +155,7 @@ export async function signInWithGooglePopup(): Promise<{
   name: string;
   picture?: string;
   uid: string;
+  idToken: string;
   hasGmailScope: boolean;
 }> {
   const result = await signInWithPopup(auth, googleProvider);
@@ -166,11 +167,13 @@ export async function signInWithGooglePopup(): Promise<{
   if (!fbUser.email) {
     throw new Error('Google sign-in did not return a verified email address.');
   }
+  const idToken = await fbUser.getIdToken();
   return {
     email: fbUser.email,
     name: fbUser.displayName || fbUser.email.split('@')[0],
     picture: fbUser.photoURL || undefined,
     uid: fbUser.uid,
+    idToken,
     hasGmailScope: Boolean(gmailAccessToken)
   };
 }

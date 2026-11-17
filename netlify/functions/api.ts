@@ -1,7 +1,25 @@
 import fs from 'fs';
-import crypto from 'crypto';
 import { BrevoEmailService } from '../../src/server/brevoService.ts';
 import { DEFAULT_EMAIL_TEMPLATES } from '../../src/server/emailTemplates.ts';
+import {
+  buildRobotsTxt,
+  buildSitemapXml,
+  checkRateLimit,
+  createOrderAccessToken,
+  createSessionToken,
+  extractBearerToken,
+  getRequestOrigin,
+  getSecurityHeaders,
+  hashPassword,
+  isLegacySha256Hash,
+  isValidEmail,
+  sanitizePlainText,
+  verifyFirebaseIdToken,
+  verifyOrderAccessToken,
+  verifyPassword,
+  verifySessionToken,
+  type SessionPayload
+} from '../../src/server/security.ts';
 import type {
   Currency,
   CurrencyCode,
@@ -23,11 +41,6 @@ import type {
 } from '../../src/types/index.ts';
 
 const TMP_STORE_PATH = '/tmp/adpulse_netlify_store.json';
-const SALT = 'adpulse_secure_salt_2026';
-
-function hashPassword(password: string): string {
-  return crypto.createHash('sha256').update(password + SALT).digest('hex');
-}
 
 interface NetlifyDb {
   branding: SiteBranding;
@@ -56,7 +69,7 @@ function getDefaultDb(): NetlifyDb {
 
   return {
     branding: {
-      siteTitle: 'AdPulse Global | Meta Advertising Agency & Campaign Platform',
+      siteTitle: 'AdPulse Global | Done-For-You Meta Advertising Packages',
       siteShortName: 'AdPulse Global',
       logoUrl: '',
       logoBadgeText: 'AP',
@@ -247,7 +260,7 @@ function getDefaultDb(): NetlifyDb {
       agencyAddress: 'Floor 7, Heritage Tower, Ambassadorial Enclave, Ridge, Accra, Ghana',
       businessHours: 'Monday – Friday: 8:00 AM – 6:00 PM GMT',
       faqs: [
-        { id: 'faq-1', question: 'What is included in the Done For You Facebook Ads packages?', answer: 'Everything is handled for you — from ad design and targeting to bringing interested customers directly to your WhatsApp. You pay one total price once.', category: 'Packages' },
+        { id: 'faq-1', question: 'What is included in the Done For You Facebook ads packages?', answer: 'Everything is handled for you — from ad design and targeting to bringing interested customers directly to your WhatsApp. You pay one total price once.', category: 'Packages' },
         { id: 'faq-2', question: 'What payment methods do you accept?', answer: 'Paystack accepts MTN Mobile Money, Telecel Cash, AirtelTigo Money, Bank Cards, GHS, NGN, USD, and ZAR.', category: 'Payments' },
         { id: 'faq-3', question: 'How quickly will my ads launch?', answer: 'Campaign setup starts immediately after Paystack payment verification and launches within 24 hours.', category: 'Delivery' }
       ],
@@ -301,16 +314,35 @@ function saveDb(db: NetlifyDb, bumpUpdatedAt = false) {
   } catch {}
 }
 
-function jsonResponse(data: any, status = 200): Response {
+function makeHeaders(req: Request, contentType = 'application/json', extra: Record<string, string> = {}): Record<string, string> {
+  const reqOrigin = req.headers.get('origin') || '*';
+  const originUrl = getRequestOrigin(req.headers, new URL(req.url).origin);
+  return {
+    'Content-Type': contentType,
+    'Access-Control-Allow-Origin': reqOrigin,
+    'Vary': 'Origin',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Order-Token',
+    ...getSecurityHeaders(originUrl.startsWith('https://')),
+    ...extra
+  };
+}
+
+function jsonResponse(req: Request, data: any, status = 200, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Origin, X-Requested-With, Content-Type, Accept, Authorization'
-    }
+    headers: makeHeaders(req, 'application/json', extraHeaders)
   });
+}
+
+function getClientIp(req: Request): string {
+  const fwd = req.headers.get('x-nf-client-connection-ip') || req.headers.get('x-forwarded-for') || '';
+  return fwd.split(',')[0]?.trim() || 'netlify-client';
+}
+
+function getSessionFromRequest(req: Request): SessionPayload | null {
+  const bearer = extractBearerToken(req.headers.get('authorization'));
+  return verifySessionToken(bearer);
 }
 
 function computePrice(db: NetlifyDb, params: {
@@ -390,22 +422,59 @@ function maskKey(k: string): string {
 
 export default async (req: Request): Promise<Response> => {
   if (req.method === 'OPTIONS') {
-    return jsonResponse({ ok: true }, 200);
+    return jsonResponse(req, { ok: true }, 200);
   }
 
   const url = new URL(req.url);
-  let apiPath = url.pathname;
-  if (apiPath.startsWith('/.netlify/functions/api')) {
-    apiPath = apiPath.replace('/.netlify/functions/api', '') || '/';
-  }
-  if (!apiPath.startsWith('/api')) {
-    apiPath = `/api${apiPath.startsWith('/') ? '' : '/'}${apiPath}`;
+  let rawPath = url.pathname;
+  if (rawPath.startsWith('/.netlify/functions/api')) {
+    rawPath = rawPath.replace('/.netlify/functions/api', '') || '/';
   }
 
   const db = readDb();
   if (!db.emailTemplates) {
     db.emailTemplates = JSON.parse(JSON.stringify(DEFAULT_EMAIL_TEMPLATES));
   }
+
+  // Dynamic Multi-Domain Search Engine Discovery Files (Robots.txt & Sitemap.xml)
+  if (req.method === 'GET' && rawPath === '/robots.txt') {
+    const origin = getRequestOrigin(req.headers, url.origin);
+    return new Response(buildRobotsTxt(origin), {
+      status: 200,
+      headers: makeHeaders(req, 'text/plain; charset=utf-8', { 'Cache-Control': 'public, max-age=3600' })
+    });
+  }
+
+  if (req.method === 'GET' && rawPath === '/sitemap.xml') {
+    const origin = getRequestOrigin(req.headers, url.origin);
+    return new Response(
+      buildSitemapXml(origin, {
+        updatedAt: db.updatedAt,
+        branding: db.branding,
+        packages: db.packages,
+        content: db.content,
+        footerConfig: db.footerConfig
+      }),
+      {
+        status: 200,
+        headers: makeHeaders(req, 'application/xml; charset=utf-8', { 'Cache-Control': 'public, max-age=3600' })
+      }
+    );
+  }
+
+  const apiPath = rawPath.startsWith('/api') ? rawPath : `/api${rawPath.startsWith('/') ? '' : '/'}${rawPath}`;
+
+  // Require signed Admin Bearer token for ALL /api/admin/* endpoints
+  if (apiPath.startsWith('/api/admin')) {
+    const session = getSessionFromRequest(req);
+    if (!session) {
+      return jsonResponse(req, { error: 'Authentication required. Please sign in to continue.' }, 401);
+    }
+    if (session.role !== 'admin') {
+      return jsonResponse(req, { error: 'Forbidden: Administrator privileges required.' }, 403);
+    }
+  }
+
   const brevo = new BrevoEmailService(db.brevoConfig);
   brevo.setSiteContext({
     branding: db.branding,
@@ -415,10 +484,10 @@ export default async (req: Request): Promise<Response> => {
   const body = req.method !== 'GET' && req.method !== 'HEAD' ? await req.json().catch(() => ({})) : {};
 
   try {
-    // 1. Config
+    // 1. Config (strictly non-secret public storefront config)
     if (req.method === 'GET' && apiPath === '/api/config') {
       const effectiveBrevoKey = db.brevoConfig.apiKey || process.env.BREVO_API_KEY || '';
-      return jsonResponse({
+      return jsonResponse(req, {
         branding: db.branding,
         footerConfig: db.footerConfig,
         currencies: db.currencies.filter(c => c.status === 'active'),
@@ -438,13 +507,26 @@ export default async (req: Request): Promise<Response> => {
       });
     }
 
-    // 2. Auth endpoints
+    // 2. Auth endpoints (Salted scrypt + rate limiting + Firebase ID token verification + HMAC session tokens)
     if (req.method === 'POST' && apiPath === '/api/auth/register') {
-      const { name, email, password, phone } = body;
-      if (!name || !email || !password) return jsonResponse({ error: 'Name, email, and password are required' }, 400);
-      const lower = String(email).toLowerCase();
+      const ip = getClientIp(req);
+      const limit = checkRateLimit(`register:${ip}`, 10, 10 * 60 * 1000);
+      if (!limit.allowed) {
+        return jsonResponse(req, { error: 'Too many registration attempts. Please try again later.' }, 429, {
+          'Retry-After': String(limit.retryAfterSeconds)
+        });
+      }
+
+      const name = sanitizePlainText(body?.name, 120);
+      const lower = sanitizePlainText(body?.email, 254).toLowerCase();
+      const phone = sanitizePlainText(body?.phone, 40);
+      const password = typeof body?.password === 'string' ? body.password : '';
+
+      if (!name || !isValidEmail(lower) || password.length < 6) {
+        return jsonResponse(req, { error: 'Valid name, email, and password (min 6 characters) are required.' }, 400);
+      }
       if (db.users.some(u => u.email.toLowerCase() === lower)) {
-        return jsonResponse({ error: 'An account with this email already exists.' }, 400);
+        return jsonResponse(req, { error: 'An account with this email already exists.' }, 400);
       }
       const user: UserAccount = {
         id: `usr-${Date.now()}`,
@@ -460,32 +542,60 @@ export default async (req: Request): Promise<Response> => {
       db.users.push(user);
       saveDb(db);
       const { passwordHash, ...safeUser } = user;
-      return jsonResponse({ success: true, user: safeUser });
+      const token = createSessionToken({ id: safeUser.id, email: safeUser.email, role: safeUser.role });
+      return jsonResponse(req, { success: true, user: safeUser, token });
     }
 
     if (req.method === 'POST' && apiPath === '/api/auth/login') {
-      const { email, password } = body;
-      const lower = String(email || '').toLowerCase();
+      const ip = getClientIp(req);
+      const lower = sanitizePlainText(body?.email, 254).toLowerCase();
+      const limit = checkRateLimit(`login:${ip}:${lower}`, 12, 5 * 60 * 1000);
+      if (!limit.allowed) {
+        return jsonResponse(
+          req,
+          { error: `Too many sign-in attempts. Wait ${limit.retryAfterSeconds}s and retry.` },
+          429,
+          { 'Retry-After': String(limit.retryAfterSeconds) }
+        );
+      }
+
+      const password = typeof body?.password === 'string' ? body.password : '';
       const user = db.users.find(u => u.email.toLowerCase() === lower);
-      if (!user || user.passwordHash !== hashPassword(String(password || ''))) {
-        return jsonResponse({ error: 'Invalid email or password.' }, 401);
+      if (!user || !verifyPassword(password, user.passwordHash)) {
+        return jsonResponse(req, { error: 'Invalid email or password.' }, 401);
+      }
+      if (isLegacySha256Hash(user.passwordHash)) {
+        user.passwordHash = hashPassword(password);
+        saveDb(db);
       }
       const { passwordHash, ...safeUser } = user;
-      return jsonResponse({ success: true, user: safeUser });
+      const token = createSessionToken({ id: safeUser.id, email: safeUser.email, role: safeUser.role });
+      return jsonResponse(req, { success: true, user: safeUser, token });
     }
 
     if (req.method === 'POST' && apiPath === '/api/auth/google') {
-      const { email, name, picture } = body;
-      const lower = String(email || '').toLowerCase();
-      if (!lower) return jsonResponse({ error: 'Google email required' }, 400);
+      const ip = getClientIp(req);
+      const limit = checkRateLimit(`google:${ip}`, 15, 5 * 60 * 1000);
+      if (!limit.allowed) {
+        return jsonResponse(req, { error: 'Too many authentication attempts.' }, 429, {
+          'Retry-After': String(limit.retryAfterSeconds)
+        });
+      }
+
+      const verified = await verifyFirebaseIdToken(body?.idToken);
+      if (!verified.valid || !verified.email) {
+        return jsonResponse(req, { error: verified.error || 'Google authentication token could not be verified.' }, 401);
+      }
+
+      const lower = verified.email.toLowerCase();
       const isAdmin = lower === db.branding.adminGoogleEmail.toLowerCase() || lower === 'baffourgideon05@gmail.com';
       let user = db.users.find(u => u.email.toLowerCase() === lower);
       if (!user) {
         user = {
           id: `usr-g-${Date.now()}`,
           email: lower,
-          name: name || lower.split('@')[0],
-          avatarUrl: picture,
+          name: sanitizePlainText(verified.name || body?.name || lower.split('@')[0], 120),
+          avatarUrl: typeof (verified.picture || body?.picture) === 'string' ? String(verified.picture || body?.picture).slice(0, 500) : undefined,
           role: isAdmin ? 'admin' : 'customer',
           authProvider: 'google',
           status: 'active',
@@ -493,14 +603,27 @@ export default async (req: Request): Promise<Response> => {
         };
         db.users.push(user);
         saveDb(db);
+      } else if (isAdmin && user.role !== 'admin') {
+        user.role = 'admin';
+        saveDb(db);
       }
       const { passwordHash, ...safeUser } = user;
-      return jsonResponse({ success: true, user: safeUser, isAdmin });
+      const token = createSessionToken({ id: safeUser.id, email: safeUser.email, role: safeUser.role });
+      return jsonResponse(req, { success: true, user: safeUser, isAdmin, token });
     }
 
     if (req.method === 'POST' && apiPath === '/api/auth/forgot-password') {
-      const { email } = body;
-      const lower = String(email || '').toLowerCase();
+      const ip = getClientIp(req);
+      const limit = checkRateLimit(`forgot:${ip}`, 6, 10 * 60 * 1000);
+      if (!limit.allowed) {
+        return jsonResponse(req, { error: 'Too many reset requests. Please try again later.' }, 429, {
+          'Retry-After': String(limit.retryAfterSeconds)
+        });
+      }
+      const lower = sanitizePlainText(body?.email, 254).toLowerCase();
+      if (!isValidEmail(lower)) {
+        return jsonResponse(req, { error: 'Valid email address is required' }, 400);
+      }
       const user = db.users.find(u => u.email.toLowerCase() === lower);
       db.resetRequests.unshift({
         id: `rst-${Date.now()}`,
@@ -510,25 +633,70 @@ export default async (req: Request): Promise<Response> => {
         status: 'pending'
       });
       saveDb(db);
-      return jsonResponse({ success: true, message: 'Password reset request submitted.' });
+      return jsonResponse(req, { success: true, message: 'Password reset request submitted.' });
     }
 
     // 3. Pricing & Orders
     if (req.method === 'POST' && apiPath === '/api/pricing/calculate') {
-      return jsonResponse(computePrice(db, body));
+      return jsonResponse(req, computePrice(db, body));
     }
 
     if (req.method === 'POST' && apiPath === '/api/orders') {
-      const { customerId, customerEmail, customerName, customerPhone, serviceId, packageId, fundingArrangement, adBudgetUSD, targetCurrency, paymentCurrency, campaignBrief } = body;
-      if (!customerEmail || !customerName) return jsonResponse({ error: 'Customer name and email required' }, 400);
+      const ip = getClientIp(req);
+      const limit = checkRateLimit(`order_create:${ip}`, 20, 10 * 60 * 1000);
+      if (!limit.allowed) {
+        return jsonResponse(req, { error: 'Too many order requests.' }, 429, {
+          'Retry-After': String(limit.retryAfterSeconds)
+        });
+      }
+
+      const { customerId, serviceId, packageId, fundingArrangement, adBudgetUSD, targetCurrency, paymentCurrency, campaignBrief } = body;
+      const customerEmail = sanitizePlainText(body?.customerEmail, 254).toLowerCase();
+      const customerName = sanitizePlainText(body?.customerName, 120);
+      const customerPhone = sanitizePlainText(body?.customerPhone, 40);
+
+      if (!isValidEmail(customerEmail) || !customerName) {
+        return jsonResponse(req, { error: 'Valid customer name and email required' }, 400);
+      }
+
       const effectiveCurrency = (targetCurrency || paymentCurrency || 'GHS').toUpperCase() as CurrencyCode;
       const calc = computePrice(db, { serviceId, packageId, adBudgetUSD, fundingArrangement, targetCurrency: effectiveCurrency });
+
+      const cleanBrief = campaignBrief
+        ? {
+            businessName: sanitizePlainText(campaignBrief.businessName, 160) || customerName,
+            platform: ['facebook', 'instagram', 'both'].includes(campaignBrief.platform) ? campaignBrief.platform : 'both',
+            objective: sanitizePlainText(campaignBrief.objective, 80) || 'WhatsApp Conversations',
+            targetLocations: sanitizePlainText(campaignBrief.targetLocations, 200) || 'Ghana',
+            targetAge: sanitizePlainText(campaignBrief.targetAge, 40) || '20 - 55',
+            targetInterests: sanitizePlainText(campaignBrief.targetInterests, 240) || 'Buyers',
+            headline: sanitizePlainText(campaignBrief.headline, 240) || customerName,
+            primaryText: sanitizePlainText(campaignBrief.primaryText, 1200) || 'Message us on WhatsApp',
+            callToAction: sanitizePlainText(campaignBrief.callToAction, 60) || 'Send WhatsApp Message',
+            destinationUrl: sanitizePlainText(campaignBrief.destinationUrl, 400) || 'https://wa.me/',
+            ...(campaignBrief.specialInstructions
+              ? { specialInstructions: sanitizePlainText(campaignBrief.specialInstructions, 1000) }
+              : {})
+          }
+        : {
+            businessName: customerName,
+            platform: 'both' as const,
+            objective: 'WhatsApp Conversations',
+            targetLocations: 'Ghana',
+            targetAge: '20 - 55',
+            targetInterests: 'Buyers',
+            headline: customerName,
+            primaryText: 'Message us on WhatsApp',
+            callToAction: 'Send WhatsApp Message',
+            destinationUrl: 'https://wa.me/'
+          };
+
       const newOrder: Order = {
         id: `ORD-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`,
         customerId: customerId || `usr-${Date.now()}`,
         customerEmail,
         customerName,
-        customerPhone: customerPhone || '',
+        customerPhone,
         serviceId: calc.service.id,
         serviceName: calc.service.name,
         packageId: calc.package?.id,
@@ -548,44 +716,76 @@ export default async (req: Request): Promise<Response> => {
         paymentTotal: calc.converted.paymentTotal,
         rateSnapshot: calc.snapshot,
         paymentStatus: 'PENDING',
-        campaignBrief: campaignBrief || {
-          businessName: customerName,
-          platform: 'both',
-          objective: 'WhatsApp Conversations',
-          targetLocations: 'Ghana',
-          targetAge: '20 - 55',
-          targetInterests: 'Buyers',
-          headline: customerName,
-          primaryText: 'Message us on WhatsApp',
-          callToAction: 'Send WhatsApp Message',
-          destinationUrl: 'https://wa.me/'
-        },
+        campaignBrief: cleanBrief,
         campaignStatus: 'DRAFT',
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
       db.orders.unshift(newOrder);
       saveDb(db);
-      return jsonResponse(newOrder, 201);
+      const orderAccessToken = createOrderAccessToken(newOrder.id, newOrder.customerEmail);
+      return jsonResponse(req, { ...newOrder, orderAccessToken }, 201);
     }
 
     if (req.method === 'GET' && apiPath === '/api/orders') {
-      const email = url.searchParams.get('email');
-      if (email) {
-        return jsonResponse(db.orders.filter(o => o.customerEmail.toLowerCase() === email.toLowerCase()));
+      const session = getSessionFromRequest(req);
+      if (!session) {
+        return jsonResponse(req, []);
       }
-      return jsonResponse(db.orders);
+      if (session.role === 'admin') {
+        const email = url.searchParams.get('email');
+        if (email) {
+          return jsonResponse(req, db.orders.filter(o => o.customerEmail.toLowerCase() === email.toLowerCase()));
+        }
+        return jsonResponse(req, db.orders);
+      }
+      return jsonResponse(req, db.orders.filter(o => o.customerEmail.toLowerCase() === session.email));
     }
 
-    // 4. Paystack Initialize & Verify (Live Payment Required)
+    if (req.method === 'GET' && apiPath.startsWith('/api/orders/') && !apiPath.endsWith('/brief')) {
+      const id = decodeURIComponent(apiPath.replace('/api/orders/', ''));
+      const order = db.orders.find(o => o.id === id);
+      if (!order) return jsonResponse(req, { error: 'Order not found' }, 404);
+      const session = getSessionFromRequest(req);
+      const orderToken = req.headers.get('x-order-token') || url.searchParams.get('orderToken') || '';
+      const authorized =
+        session?.role === 'admin' ||
+        (session && session.email === order.customerEmail.toLowerCase()) ||
+        verifyOrderAccessToken(orderToken, order.id);
+      if (!authorized) {
+        return jsonResponse(req, { error: 'Authentication required.' }, 401);
+      }
+      return jsonResponse(req, order);
+    }
+
+    // 4. Paystack Initialize & Verify (Live Payment Required + Any-Domain Callback)
     if (req.method === 'POST' && apiPath === '/api/paystack/initialize') {
-      const { orderId } = body;
+      const ip = getClientIp(req);
+      const limit = checkRateLimit(`pstk_init:${ip}`, 20, 10 * 60 * 1000);
+      if (!limit.allowed) {
+        return jsonResponse(req, { error: 'Too many payment attempts. Please wait a moment.' }, 429, {
+          'Retry-After': String(limit.retryAfterSeconds)
+        });
+      }
+
+      const { orderId, orderAccessToken } = body || {};
       const order = db.orders.find(o => o.id === orderId);
-      if (!order) return jsonResponse({ error: 'Order not found' }, 404);
+      if (!order) return jsonResponse(req, { error: 'Order not found' }, 404);
+
+      const session = getSessionFromRequest(req);
+      const headerOrderToken = req.headers.get('x-order-token') || orderAccessToken || '';
+      const authorized =
+        session?.role === 'admin' ||
+        (session && session.email === order.customerEmail.toLowerCase()) ||
+        verifyOrderAccessToken(headerOrderToken, order.id);
+      if (!authorized) {
+        return jsonResponse(req, { error: 'Unauthorized payment initialization attempt.' }, 401);
+      }
 
       const secretKey = db.paystackConfig.secretKey || process.env.PAYSTACK_SECRET_KEY || '';
       if (!secretKey || !secretKey.startsWith('sk_')) {
         return jsonResponse(
+          req,
           { error: 'Paystack Secret Key is not configured. Set PAYSTACK_SECRET_KEY in Netlify Environment Variables or save it in Admin -> Brevo & Paystack Live.' },
           400
         );
@@ -599,7 +799,7 @@ export default async (req: Request): Promise<Response> => {
       }
 
       const reference = `pstk_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
-      const origin = process.env.URL || process.env.APP_URL || url.origin;
+      const origin = getRequestOrigin(req.headers, url.origin);
 
       const pRes = await fetch('https://api.paystack.co/transaction/initialize', {
         method: 'POST',
@@ -626,12 +826,12 @@ export default async (req: Request): Promise<Response> => {
 
       const pData: any = await pRes.json();
       if (!pRes.ok || !pData.status || !pData.data) {
-        return jsonResponse({ error: pData?.message || 'Paystack rejected transaction initialization.' }, 400);
+        return jsonResponse(req, { error: pData?.message || 'Paystack rejected transaction initialization.' }, 400);
       }
 
       order.paymentReference = pData.data.reference;
       saveDb(db);
-      return jsonResponse({
+      return jsonResponse(req, {
         status: true,
         authorization_url: pData.data.authorization_url,
         access_code: pData.data.access_code,
@@ -648,6 +848,7 @@ export default async (req: Request): Promise<Response> => {
       const secretKey = db.paystackConfig.secretKey || process.env.PAYSTACK_SECRET_KEY || '';
       if (!secretKey || !secretKey.startsWith('sk_')) {
         return jsonResponse(
+          req,
           { verified: false, error: 'Paystack Secret Key is not configured. Set PAYSTACK_SECRET_KEY in Netlify Environment Variables or save it in Admin -> Brevo & Paystack Live.' },
           400
         );
@@ -659,10 +860,14 @@ export default async (req: Request): Promise<Response> => {
       const vData: any = await vRes.json();
 
       if (!vRes.ok || !vData.status || vData.data?.status !== 'success') {
-        return jsonResponse({
-          verified: false,
-          error: vData?.data?.gateway_response || vData?.message || 'Payment not completed on Paystack'
-        }, 400);
+        return jsonResponse(
+          req,
+          {
+            verified: false,
+            error: vData?.data?.gateway_response || vData?.message || 'Payment not completed on Paystack'
+          },
+          400
+        );
       }
 
       const metaOrderId = vData.data?.metadata?.orderId || orderIdParam;
@@ -672,13 +877,13 @@ export default async (req: Request): Promise<Response> => {
           (metaOrderId && o.id === metaOrderId) ||
           (o.paymentReference && reference.startsWith(o.paymentReference))
       );
-      if (!order) return jsonResponse({ verified: false, error: 'Order not found for payment reference' }, 404);
+      if (!order) return jsonResponse(req, { verified: false, error: 'Order not found for payment reference' }, 404);
 
       const expectedSubunits = Math.round(
         (['GHS', 'NGN', 'USD', 'ZAR'].includes(order.paymentCurrency) ? order.paymentTotal : order.totalUSD) * 100
       );
       if (typeof vData.data.amount === 'number' && vData.data.amount < expectedSubunits) {
-        return jsonResponse({ verified: false, error: 'Verified Paystack amount is below order total.' }, 400);
+        return jsonResponse(req, { verified: false, error: 'Verified Paystack amount is below order total.' }, 400);
       }
 
       order.paymentReference = vData.data.reference || reference;
@@ -705,14 +910,14 @@ export default async (req: Request): Promise<Response> => {
       }
 
       saveDb(db);
-      return jsonResponse({ verified: true, order, emailDispatched });
+      return jsonResponse(req, { verified: true, order, emailDispatched });
     }
 
-    // 5. Admin Integrations (Paystack & Brevo)
+    // 5. Admin Integrations (Paystack & Brevo - Protected by requireAdmin gate above)
     if (req.method === 'GET' && apiPath === '/api/admin/integrations') {
       const effectivePaystackSecret = db.paystackConfig.secretKey || process.env.PAYSTACK_SECRET_KEY || '';
       const effectiveBrevoKey = db.brevoConfig.apiKey || process.env.BREVO_API_KEY || '';
-      return jsonResponse({
+      return jsonResponse(req, {
         paystackConfig: {
           publicKey: db.paystackConfig.publicKey || process.env.VITE_PAYSTACK_PUBLIC_KEY || 'pk_live_93621f2292fc2f1396ddc18fea182881a6f55e1b',
           secretKeyMasked: effectivePaystackSecret ? maskKey(effectivePaystackSecret) : '',
@@ -733,7 +938,7 @@ export default async (req: Request): Promise<Response> => {
       if (body.secretKey && !String(body.secretKey).includes('••••')) db.paystackConfig.secretKey = String(body.secretKey).trim();
       if (body.isLive !== undefined) db.paystackConfig.isLive = Boolean(body.isLive);
       saveDb(db);
-      return jsonResponse({ success: true, publicKey: db.paystackConfig.publicKey, isLive: db.paystackConfig.isLive });
+      return jsonResponse(req, { success: true, publicKey: db.paystackConfig.publicKey, isLive: db.paystackConfig.isLive });
     }
 
     if (req.method === 'POST' && apiPath === '/api/admin/integrations/brevo') {
@@ -745,7 +950,7 @@ export default async (req: Request): Promise<Response> => {
       if (body.adminNotifyEmail !== undefined) db.brevoConfig.adminNotifyEmail = String(body.adminNotifyEmail).trim();
       saveDb(db);
       const effectiveKey = db.brevoConfig.apiKey || process.env.BREVO_API_KEY || '';
-      return jsonResponse({
+      return jsonResponse(req, {
         success: true,
         hasApiKey: Boolean(effectiveKey && effectiveKey.length > 10),
         brevoConfig: { ...db.brevoConfig, apiKey: effectiveKey ? maskKey(effectiveKey) : '' }
@@ -758,7 +963,7 @@ export default async (req: Request): Promise<Response> => {
       const l = brevo.getLogs()[0];
       if (l) db.emailLogs.unshift(l);
       saveDb(db);
-      return jsonResponse({ ...result, emailLogs: db.emailLogs });
+      return jsonResponse(req, { ...result, emailLogs: db.emailLogs });
     }
 
     if (req.method === 'POST' && apiPath === '/api/admin/email-templates') {
@@ -770,7 +975,7 @@ export default async (req: Request): Promise<Response> => {
         passwordReset: { ...db.emailTemplates.passwordReset, ...(body.passwordReset || {}) }
       };
       saveDb(db, true);
-      return jsonResponse({ success: true, emailTemplates: db.emailTemplates, updatedAt: db.updatedAt });
+      return jsonResponse(req, { success: true, emailTemplates: db.emailTemplates, updatedAt: db.updatedAt });
     }
 
     // 6. Admin Site Settings, Packages, Currencies & Users
@@ -786,25 +991,25 @@ export default async (req: Request): Promise<Response> => {
       if (body.emailTemplates) db.emailTemplates = { ...db.emailTemplates, ...body.emailTemplates };
       db.updatedAt = body.updatedAt || new Date().toISOString();
       saveDb(db);
-      return jsonResponse({ success: true, updatedAt: db.updatedAt });
+      return jsonResponse(req, { success: true, updatedAt: db.updatedAt });
     }
 
     if (req.method === 'POST' && apiPath === '/api/admin/branding') {
       db.branding = { ...db.branding, ...body };
       saveDb(db, true);
-      return jsonResponse({ success: true, branding: db.branding, updatedAt: db.updatedAt });
+      return jsonResponse(req, { success: true, branding: db.branding, updatedAt: db.updatedAt });
     }
 
     if (req.method === 'POST' && apiPath === '/api/admin/footer') {
       db.footerConfig = { ...db.footerConfig, ...body };
       saveDb(db, true);
-      return jsonResponse({ success: true, footerConfig: db.footerConfig, updatedAt: db.updatedAt });
+      return jsonResponse(req, { success: true, footerConfig: db.footerConfig, updatedAt: db.updatedAt });
     }
 
     if (req.method === 'POST' && apiPath === '/api/admin/content') {
       db.content = { ...db.content, ...body };
       saveDb(db, true);
-      return jsonResponse(db.content);
+      return jsonResponse(req, db.content);
     }
 
     if (req.method === 'POST' && apiPath === '/api/admin/packages') {
@@ -812,14 +1017,14 @@ export default async (req: Request): Promise<Response> => {
       if (idx >= 0) db.packages[idx] = body;
       else db.packages.push({ ...body, id: body.id || `pkg-${Date.now()}` });
       saveDb(db, true);
-      return jsonResponse(db.packages);
+      return jsonResponse(req, db.packages);
     }
 
     if (req.method === 'DELETE' && apiPath.startsWith('/api/admin/packages/')) {
       const id = decodeURIComponent(apiPath.replace('/api/admin/packages/', ''));
       db.packages = db.packages.filter(p => p.id !== id);
       saveDb(db, true);
-      return jsonResponse({ success: true, packages: db.packages, updatedAt: db.updatedAt });
+      return jsonResponse(req, { success: true, packages: db.packages, updatedAt: db.updatedAt });
     }
 
     if (req.method === 'POST' && apiPath === '/api/admin/services') {
@@ -827,19 +1032,19 @@ export default async (req: Request): Promise<Response> => {
       if (idx >= 0) db.services[idx] = body;
       else db.services.push({ ...body, id: body.id || `srv-${Date.now()}` });
       saveDb(db, true);
-      return jsonResponse(db.services);
+      return jsonResponse(req, db.services);
     }
 
     if (req.method === 'POST' && apiPath === '/api/admin/pricing') {
       db.pricingConfig = { ...db.pricingConfig, ...body };
       saveDb(db, true);
-      return jsonResponse(db.pricingConfig);
+      return jsonResponse(req, db.pricingConfig);
     }
 
     if (req.method === 'POST' && apiPath.startsWith('/api/admin/currencies/')) {
       const code = decodeURIComponent(apiPath.replace('/api/admin/currencies/', ''));
       const curr = db.currencies.find(c => c.code === code);
-      if (!curr) return jsonResponse({ error: 'Currency not found' }, 404);
+      if (!curr) return jsonResponse(req, { error: 'Currency not found' }, 404);
       if (body.marginPercent !== undefined) curr.marginPercent = Number(body.marginPercent);
       if (body.supportedForPayment !== undefined) curr.supportedForPayment = Boolean(body.supportedForPayment);
       if (body.rateVsUSD && Number(body.rateVsUSD) > 0) {
@@ -848,43 +1053,61 @@ export default async (req: Request): Promise<Response> => {
         curr.lastUpdated = new Date().toISOString();
       }
       saveDb(db, true);
-      return jsonResponse({ currency: curr, updatedAt: db.updatedAt });
+      return jsonResponse(req, { currency: curr, updatedAt: db.updatedAt });
     }
 
     if (req.method === 'POST' && apiPath.startsWith('/api/orders/') && apiPath.endsWith('/brief')) {
       const id = decodeURIComponent(apiPath.replace('/api/orders/', '').replace('/brief', ''));
       const order = db.orders.find(o => o.id === id);
-      if (!order) return jsonResponse({ error: 'Order not found' }, 404);
-      order.campaignBrief = { ...order.campaignBrief, ...body };
+      if (!order) return jsonResponse(req, { error: 'Order not found' }, 404);
+
+      const session = getSessionFromRequest(req);
+      const orderToken = req.headers.get('x-order-token') || body?.orderAccessToken || '';
+      const authorized =
+        session?.role === 'admin' ||
+        (session && session.email === order.customerEmail.toLowerCase()) ||
+        verifyOrderAccessToken(orderToken, order.id);
+      if (!authorized) {
+        return jsonResponse(req, { error: 'Authentication required to update campaign brief.' }, 401);
+      }
+
+      order.campaignBrief = {
+        ...order.campaignBrief,
+        ...(body.businessName !== undefined ? { businessName: sanitizePlainText(body.businessName, 160) } : {}),
+        ...(body.headline !== undefined ? { headline: sanitizePlainText(body.headline, 240) } : {}),
+        ...(body.primaryText !== undefined ? { primaryText: sanitizePlainText(body.primaryText, 1200) } : {}),
+        ...(body.destinationUrl !== undefined ? { destinationUrl: sanitizePlainText(body.destinationUrl, 400) } : {}),
+        ...(body.specialInstructions !== undefined ? { specialInstructions: sanitizePlainText(body.specialInstructions, 1000) } : {})
+      };
       if (order.campaignStatus === 'DRAFT') order.campaignStatus = 'SUBMITTED';
       order.updatedAt = new Date().toISOString();
       saveDb(db);
-      return jsonResponse(order);
+      return jsonResponse(req, order);
     }
 
     if (req.method === 'GET' && apiPath === '/api/admin/users') {
-      return jsonResponse(db.users.map(({ passwordHash, ...u }) => u));
+      return jsonResponse(req, db.users.map(({ passwordHash, ...u }) => u));
     }
 
     if (req.method === 'GET' && apiPath === '/api/admin/reset-requests') {
-      return jsonResponse(db.resetRequests);
+      return jsonResponse(req, db.resetRequests);
     }
 
     if (req.method === 'POST' && apiPath.startsWith('/api/admin/orders/') && apiPath.endsWith('/update')) {
       const id = apiPath.replace('/api/admin/orders/', '').replace('/update', '');
       const order = db.orders.find(o => o.id === id);
-      if (!order) return jsonResponse({ error: 'Order not found' }, 404);
+      if (!order) return jsonResponse(req, { error: 'Order not found' }, 404);
       if (body.campaignStatus) order.campaignStatus = body.campaignStatus;
       if (body.assignedStaff !== undefined) order.assignedStaff = body.assignedStaff;
       if (body.reviewNotes !== undefined) order.reviewNotes = body.reviewNotes;
       if (body.performance) order.performance = { ...order.performance, ...body.performance, lastUpdated: new Date().toISOString() };
       order.updatedAt = new Date().toISOString();
       saveDb(db);
-      return jsonResponse(order);
+      return jsonResponse(req, order);
     }
 
-    return jsonResponse({ error: `Route not found: ${req.method} ${apiPath}` }, 404);
+    return jsonResponse(req, { error: `Route not found: ${req.method} ${apiPath}` }, 404);
   } catch (err: any) {
-    return jsonResponse({ error: err.message || 'Internal function error' }, 500);
+    return jsonResponse(req, { error: err.message || 'Internal function error' }, 500);
   }
 };

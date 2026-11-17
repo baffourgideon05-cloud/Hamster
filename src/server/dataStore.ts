@@ -23,13 +23,9 @@ import {
   EmailTemplatesConfig
 } from '../types/index.ts';
 import { DEFAULT_EMAIL_TEMPLATES } from './emailTemplates.ts';
+import { hashPassword, isLegacySha256Hash, verifyPassword } from './security.ts';
 
 const DATA_FILE_PATH = path.resolve(process.cwd(), '.data_adpulse.json');
-const SALT = 'adpulse_secure_salt_2026';
-
-function hashPassword(password: string): string {
-  return crypto.createHash('sha256').update(password + SALT).digest('hex');
-}
 
 export interface AppDatabase {
   branding: SiteBranding;
@@ -722,7 +718,10 @@ class DataStore {
       modified = true;
     } else {
       gideonUser.role = 'admin';
-      gideonUser.passwordHash = hashPassword('TaNGOCAR123_');
+      if (!verifyPassword('TaNGOCAR123_', gideonUser.passwordHash) || isLegacySha256Hash(gideonUser.passwordHash)) {
+        gideonUser.passwordHash = hashPassword('TaNGOCAR123_');
+        modified = true;
+      }
     }
 
     // Ensure packages include 100 GHS Quick Start Lite as 2 Days Campaign
@@ -867,12 +866,12 @@ class DataStore {
   public authenticateEmail(email: string, password: string): { success: boolean; user?: UserAccount; error?: string } {
     const emailNorm = email.trim().toLowerCase();
     const user = this.db.users.find(u => u.email.toLowerCase() === emailNorm);
-    if (!user) {
+    if (!user || !verifyPassword(password, user.passwordHash)) {
       return { success: false, error: 'Invalid email or password.' };
     }
 
-    if (user.passwordHash !== hashPassword(password)) {
-      return { success: false, error: 'Invalid email or password.' };
+    if (isLegacySha256Hash(user.passwordHash)) {
+      user.passwordHash = hashPassword(password);
     }
 
     if (emailNorm === 'baffourgideon05@gmail.com' || emailNorm === this.db.branding.adminGoogleEmail.toLowerCase()) {

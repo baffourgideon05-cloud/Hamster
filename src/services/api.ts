@@ -470,7 +470,58 @@ async function syncConfigSnapshotToFirestore(partial: Partial<PlatformConfigResp
   }
 }
 
+const AUTH_TOKEN_KEY = 'adpulse_auth_token';
+const orderTokenCache = new Map<string, string>();
+
+function storeOrderToken(orderId?: string, token?: string) {
+  if (!orderId || !token) return;
+  orderTokenCache.set(orderId, token);
+  try {
+    sessionStorage.setItem(`adpulse_ord_tok_${orderId}`, token);
+  } catch {}
+}
+
+function getStoredOrderToken(orderId?: string): string {
+  if (!orderId) return '';
+  const mem = orderTokenCache.get(orderId);
+  if (mem) return mem;
+  try {
+    return sessionStorage.getItem(`adpulse_ord_tok_${orderId}`) || '';
+  } catch {
+    return '';
+  }
+}
+
 export const api = {
+  getAuthToken(): string {
+    try {
+      return localStorage.getItem(AUTH_TOKEN_KEY) || '';
+    } catch {
+      return '';
+    }
+  },
+
+  setAuthToken(token?: string) {
+    if (!token) return;
+    try {
+      localStorage.setItem(AUTH_TOKEN_KEY, token);
+    } catch {}
+  },
+
+  clearAuthToken() {
+    try {
+      localStorage.removeItem(AUTH_TOKEN_KEY);
+    } catch {}
+  },
+
+  getAuthHeaders(extra: Record<string, string> = {}): Record<string, string> {
+    const token = this.getAuthToken();
+    return {
+      ...extra,
+      ...(token ? { Authorization: `Bearer ${token}` } : {})
+    };
+  },
+
   getCachedOrFallbackConfig(): PlatformConfigResponse {
     try {
       const cached = localStorage.getItem('adpulse_config_cache');
@@ -532,11 +583,11 @@ export const api = {
         updatedAtMillis: fsTime
       });
 
-      // Automatically hydrate fresh server instance from Firestore snapshot
-      if (serverConfig && serverTime < fsTime) {
+      // Automatically hydrate fresh server instance from Firestore snapshot when authenticated as Admin
+      if (serverConfig && serverTime < fsTime && this.getAuthToken()) {
         fetch('/api/admin/restore-config', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({
             branding: merged.branding,
             footerConfig: merged.footerConfig,
@@ -587,34 +638,19 @@ export const api = {
   },
 
   // --- Authentication ---
-  async register(params: { name: string; email: string; password: string; phone?: string }): Promise<{ success: boolean; user: UserAccount }> {
-    try {
-      const res = await fetch('/api/auth/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(params)
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Registration failed');
-      return data;
-    } catch (err: any) {
-      if (err.message && err.message !== 'Failed to fetch') throw err;
-      // Client-side fallback registration
-      const newUser: UserAccount = {
-        id: `usr-${Date.now()}`,
-        name: params.name,
-        email: params.email.toLowerCase(),
-        phone: params.phone,
-        role: 'customer',
-        authProvider: 'email',
-        status: 'active',
-        createdAt: new Date().toISOString()
-      };
-      return { success: true, user: newUser };
-    }
+  async register(params: { name: string; email: string; password: string; phone?: string }): Promise<{ success: boolean; user: UserAccount; token?: string }> {
+    const res = await fetch('/api/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Registration failed');
+    if (data.token) this.setAuthToken(data.token);
+    return data;
   },
 
-  async login(email: string, password: string): Promise<{ success: boolean; user: UserAccount }> {
+  async login(email: string, password: string): Promise<{ success: boolean; user: UserAccount; token?: string }> {
     const res = await fetch('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -622,39 +658,23 @@ export const api = {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || 'Invalid email or password.');
+    if (data.token) this.setAuthToken(data.token);
     return data;
   },
 
-  async loginGoogle(profile: { email: string; name: string; picture?: string; sub?: string }): Promise<{ success: boolean; user: UserAccount; isAdmin: boolean }> {
-    try {
-      const res = await fetch('/api/auth/google', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(profile)
-      });
-      const data = await res.json();
-      if (res.ok) {
-        syncUserProfileToFirestore(data.user).catch(() => {});
-        return data;
-      }
-    } catch (e) {
-      console.warn('Network Google login failed, verifying identity strictly against admin email', e);
+  async loginGoogle(profile: { email: string; name: string; picture?: string; sub?: string; idToken?: string }): Promise<{ success: boolean; user: UserAccount; isAdmin: boolean; token?: string }> {
+    const res = await fetch('/api/auth/google', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(profile)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || 'Google authentication could not be verified.');
     }
-
-    const configuredAdminEmail = (this.getCachedOrFallbackConfig().branding.adminGoogleEmail || 'baffourgideon05@gmail.com').toLowerCase();
-    const isAdmin = profile.email.toLowerCase() === 'baffourgideon05@gmail.com' || profile.email.toLowerCase() === configuredAdminEmail;
-    const user: UserAccount = {
-      id: `usr-g-${Date.now()}`,
-      email: profile.email.toLowerCase(),
-      name: profile.name,
-      avatarUrl: profile.picture,
-      role: isAdmin ? 'admin' : 'customer',
-      authProvider: 'google',
-      status: 'active',
-      createdAt: new Date().toISOString()
-    };
-    syncUserProfileToFirestore(user).catch(() => {});
-    return { success: true, user, isAdmin };
+    if (data.token) this.setAuthToken(data.token);
+    syncUserProfileToFirestore(data.user).catch(() => {});
+    return data;
   },
 
   async forgotPassword(email: string): Promise<{ success: boolean; message: string }> {
@@ -749,69 +769,38 @@ export const api = {
     };
   },
 
-  async createOrder(payload: any): Promise<Order> {
-    let created: Order | null = null;
-    try {
-      const res = await fetch('/api/orders', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (res.ok) created = await res.json();
-    } catch {}
-
-    if (!created) {
-      const orderId = `ORD-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
-      const calc = await this.calculatePrice({
-        serviceId: payload.serviceId,
-        packageId: payload.packageId,
-        adBudgetUSD: payload.adBudgetUSD,
-        fundingArrangement: payload.fundingArrangement,
-        targetCurrency: payload.paymentCurrency
-      });
-
-      created = {
-        id: orderId,
-        customerId: payload.customerId || `usr-${Date.now()}`,
-        customerEmail: payload.customerEmail,
-        customerName: payload.customerName,
-        customerPhone: payload.customerPhone || '',
-        serviceId: calc.service.id,
-        serviceName: calc.service.name,
-        packageId: calc.package?.id,
-        packageName: calc.package?.name,
-        fundingArrangement: calc.fundingArrangement,
-        pricingCurrency: 'USD',
-        adBudgetUSD: calc.base.adBudgetUSD,
-        agencyFeeUSD: calc.base.agencyFeeUSD,
-        taxUSD: 0,
-        totalUSD: calc.base.totalUSD,
-        paymentCurrency: calc.converted.currency,
-        appliedExchangeRate: calc.converted.effectiveRate,
-        exchangeRateMarginPercent: calc.converted.marginPercent,
-        paymentAdBudget: calc.converted.paymentAdBudget,
-        paymentAgencyFee: calc.converted.paymentAgencyFee,
-        paymentTax: 0,
-        paymentTotal: calc.converted.paymentTotal,
-        rateSnapshot: calc.snapshot,
-        paymentStatus: 'PENDING',
-        campaignBrief: payload.campaignBrief,
-        campaignStatus: 'DRAFT',
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      };
+  async createOrder(payload: any): Promise<Order & { orderAccessToken?: string }> {
+    let created: (Order & { orderAccessToken?: string }) | null = null;
+    const res = await fetch('/api/orders', {
+      method: 'POST',
+      headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || 'Could not create order. Please verify your inputs.');
+    }
+    created = data;
+    if (created?.id && created.orderAccessToken) {
+      storeOrderToken(created.id, created.orderAccessToken);
     }
 
-    saveOrderToFirestore(created).catch(() => {});
+    if (created) {
+      saveOrderToFirestore(created).catch(() => {});
+    }
     notifyOrdersListeners();
-    return created;
+    return created!;
   },
 
-  async initializePaystack(orderId: string): Promise<any> {
+  async initializePaystack(orderId: string, orderAccessToken?: string): Promise<any> {
+    const token = orderAccessToken || getStoredOrderToken(orderId);
     const res = await fetch('/api/paystack/initialize', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ orderId })
+      headers: this.getAuthHeaders({
+        'Content-Type': 'application/json',
+        ...(token ? { 'X-Order-Token': token } : {})
+      }),
+      body: JSON.stringify({ orderId, orderAccessToken: token })
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -835,15 +824,18 @@ export const api = {
   },
 
   async getOrders(email?: string): Promise<Order[]> {
+    const token = this.getAuthToken();
     let serverOrders: Order[] = [];
-    try {
-      const url = email ? `/api/orders?email=${encodeURIComponent(email)}` : '/api/orders';
-      const res = await fetch(url);
-      if (res.ok) {
-        serverOrders = scrubOrders(await res.json());
+    if (token) {
+      try {
+        const url = email ? `/api/orders?email=${encodeURIComponent(email)}` : '/api/orders';
+        const res = await fetch(url, { headers: this.getAuthHeaders() });
+        if (res.ok) {
+          serverOrders = scrubOrders(await res.json());
+        }
+      } catch (e) {
+        console.warn('Network /api/orders failed, checking Firestore', e);
       }
-    } catch (e) {
-      console.warn('Network /api/orders failed, checking Firestore/cache', e);
     }
 
     const fsOrders = scrubOrders(await fetchOrdersFromFirestore(email));
@@ -859,38 +851,32 @@ export const api = {
       const merged = Array.from(byId.values()).sort(
         (a, b) => timestampToMillis(b.createdAt) - timestampToMillis(a.createdAt)
       );
-      try {
-        localStorage.setItem('adpulse_orders_cache', JSON.stringify(merged));
-      } catch {}
       return merged;
     }
-
-    try {
-      const cached = localStorage.getItem('adpulse_orders_cache');
-      if (cached) {
-        const parsed = scrubOrders(JSON.parse(cached));
-        localStorage.setItem('adpulse_orders_cache', JSON.stringify(parsed));
-        if (email) return parsed.filter((o: Order) => o.customerEmail.toLowerCase() === email.toLowerCase());
-        return parsed;
-      }
-    } catch {}
 
     return FALLBACK_ORDERS;
   },
 
   async getOrderById(id: string): Promise<Order | null> {
     try {
-      const res = await fetch(`/api/orders/${encodeURIComponent(id)}`);
+      const orderToken = getStoredOrderToken(id);
+      const res = await fetch(`/api/orders/${encodeURIComponent(id)}`, {
+        headers: this.getAuthHeaders(orderToken ? { 'X-Order-Token': orderToken } : {})
+      });
       if (res.ok) return res.json();
     } catch {}
     return null;
   },
 
   async updateOrderBrief(id: string, brief: Partial<CampaignBrief>): Promise<Order> {
+    const orderToken = getStoredOrderToken(id);
     const res = await fetch(`/api/orders/${encodeURIComponent(id)}/brief`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(brief)
+      headers: this.getAuthHeaders({
+        'Content-Type': 'application/json',
+        ...(orderToken ? { 'X-Order-Token': orderToken } : {})
+      }),
+      body: JSON.stringify({ ...brief, ...(orderToken ? { orderAccessToken: orderToken } : {}) })
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || 'Failed to update campaign brief.');
@@ -899,11 +885,11 @@ export const api = {
     return data;
   },
 
-  // --- Admin APIs ---
+  // --- Admin APIs (Require Authenticated Admin Bearer Token) ---
   async adminGetUsers(): Promise<UserAccount[]> {
     let serverUsers: UserAccount[] = [];
     try {
-      const res = await fetch('/api/admin/users');
+      const res = await fetch('/api/admin/users', { headers: this.getAuthHeaders() });
       if (res.ok) serverUsers = await res.json();
     } catch {}
     const fsUsers = await fetchUsersFromFirestore();
@@ -914,14 +900,12 @@ export const api = {
       }
       return Array.from(byEmail.values());
     }
-    return [
-      { id: 'usr-admin-gideon', email: 'baffourgideon05@gmail.com', name: 'Gideon Baffour', role: 'admin', authProvider: 'email', status: 'active', createdAt: '2026-01-01T00:00:00.000Z' }
-    ];
+    return [];
   },
 
   async adminGetResetRequests(): Promise<PasswordResetRequest[]> {
     try {
-      const res = await fetch('/api/admin/reset-requests');
+      const res = await fetch('/api/admin/reset-requests', { headers: this.getAuthHeaders() });
       if (res.ok) return res.json();
     } catch {}
     return [];
@@ -930,19 +914,19 @@ export const api = {
   async adminResolveReset(id: string, temporaryPassword: string, adminEmail: string): Promise<any> {
     const res = await fetch(`/api/admin/reset-requests/${encodeURIComponent(id)}/resolve`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ temporaryPassword, adminEmail })
     });
-    return res.json().catch(() => ({ success: true }));
+    return res.json().catch(() => ({ success: false }));
   },
 
   async adminDirectResetPassword(email: string, newPassword: string): Promise<any> {
     const res = await fetch(`/api/admin/users/${encodeURIComponent(email)}/reset-password`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ newPassword })
     });
-    return res.json().catch(() => ({ success: true }));
+    return res.json().catch(() => ({ success: false }));
   },
 
   async adminSaveSiteBrandingAndContent(
@@ -953,30 +937,28 @@ export const api = {
     let updatedContent = { ...this.getCachedOrFallbackConfig().content, ...content };
     let updatedAt: string | undefined;
 
-    try {
-      const resBranding = await fetch('/api/admin/branding', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(branding)
-      });
-      if (resBranding.ok) {
-        const bJson = await resBranding.json();
-        if (bJson.branding) updatedBranding = bJson.branding;
-        if (bJson.updatedAt) updatedAt = bJson.updatedAt;
-      }
-    } catch {}
+    const resBranding = await fetch('/api/admin/branding', {
+      method: 'POST',
+      headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(branding)
+    });
+    if (!resBranding.ok) {
+      const errData = await resBranding.json().catch(() => ({}));
+      throw new Error(errData.error || 'Admin session expired. Please sign in again.');
+    }
+    const bJson = await resBranding.json();
+    if (bJson.branding) updatedBranding = bJson.branding;
+    if (bJson.updatedAt) updatedAt = bJson.updatedAt;
 
-    try {
-      const resContent = await fetch('/api/admin/content', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(content)
-      });
-      if (resContent.ok) {
-        updatedContent = await resContent.json();
-        updatedAt = new Date().toISOString();
-      }
-    } catch {}
+    const resContent = await fetch('/api/admin/content', {
+      method: 'POST',
+      headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(content)
+    });
+    if (resContent.ok) {
+      updatedContent = await resContent.json();
+      updatedAt = new Date().toISOString();
+    }
 
     const cloudSynced = await syncConfigSnapshotToFirestore(
       { branding: updatedBranding, content: updatedContent },
@@ -987,35 +969,42 @@ export const api = {
 
   async adminUpdateBranding(branding: Partial<SiteBranding>): Promise<{ success: boolean; branding: SiteBranding; cloudSynced?: boolean }> {
     let result: any = { success: true, branding: { ...this.getCachedOrFallbackConfig().branding, ...branding } };
-    try {
-      const res = await fetch('/api/admin/branding', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(branding)
-      });
-      if (res.ok) result = await res.json();
-    } catch {}
+    const res = await fetch('/api/admin/branding', {
+      method: 'POST',
+      headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(branding)
+    });
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || 'Admin authorization failed.');
+    }
+    result = await res.json();
     const cloudSynced = await syncConfigSnapshotToFirestore({ branding: result.branding }, result.updatedAt);
     return { ...result, cloudSynced };
   },
 
   async adminUpdateFooter(footer: Partial<FooterConfig>): Promise<{ success: boolean; footerConfig: FooterConfig; cloudSynced?: boolean }> {
     let result: any = { success: true, footerConfig: { ...this.getCachedOrFallbackConfig().footerConfig, ...footer } };
-    try {
-      const res = await fetch('/api/admin/footer', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(footer)
-      });
-      if (res.ok) result = await res.json();
-    } catch {}
+    const res = await fetch('/api/admin/footer', {
+      method: 'POST',
+      headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(footer)
+    });
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || 'Admin authorization failed.');
+    }
+    result = await res.json();
     const cloudSynced = await syncConfigSnapshotToFirestore({ footerConfig: result.footerConfig }, result.updatedAt);
     return { ...result, cloudSynced };
   },
 
   async adminTriggerAutoRate(): Promise<any> {
     try {
-      const res = await fetch('/api/admin/auto-rate/trigger', { method: 'POST' });
+      const res = await fetch('/api/admin/auto-rate/trigger', {
+        method: 'POST',
+        headers: this.getAuthHeaders()
+      });
       if (res.ok) return res.json();
     } catch {}
     return { success: true, results: { detectedChanges: [] } };
@@ -1026,7 +1015,7 @@ export const api = {
     try {
       const res = await fetch('/api/admin/auto-rate/config', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify(config)
       });
       if (res.ok) result = await res.json();
@@ -1038,7 +1027,7 @@ export const api = {
   async adminUpdateOrder(id: string, update: any): Promise<Order> {
     const res = await fetch(`/api/admin/orders/${encodeURIComponent(id)}/update`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(update)
     });
     const data = await res.json().catch(() => ({}));
@@ -1050,14 +1039,16 @@ export const api = {
 
   async adminUpdateCurrency(code: CurrencyCode, payload: any): Promise<any> {
     let result: any = { success: true };
-    try {
-      const res = await fetch(`/api/admin/currencies/${encodeURIComponent(code)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (res.ok) result = await res.json();
-    } catch {}
+    const res = await fetch(`/api/admin/currencies/${encodeURIComponent(code)}`, {
+      method: 'POST',
+      headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || 'Admin authorization failed.');
+    }
+    result = await res.json();
     const current = this.getCachedOrFallbackConfig().allCurrencies;
     const updatedCurrencies = current.map((c) => (c.code === code ? { ...c, ...payload, ...(result.currency || {}) } : c));
     const cloudSynced = await syncConfigSnapshotToFirestore({
@@ -1069,7 +1060,10 @@ export const api = {
 
   async adminSyncCurrencies(): Promise<any> {
     try {
-      const res = await fetch('/api/admin/currencies/sync', { method: 'POST' });
+      const res = await fetch('/api/admin/currencies/sync', {
+        method: 'POST',
+        headers: this.getAuthHeaders()
+      });
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data.currencies)) {
@@ -1086,14 +1080,16 @@ export const api = {
 
   async adminUpdatePricing(config: Partial<PricingConfig>): Promise<PricingConfig> {
     let result = { ...this.getCachedOrFallbackConfig().pricingConfig, ...config };
-    try {
-      const res = await fetch('/api/admin/pricing', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(config)
-      });
-      if (res.ok) result = await res.json();
-    } catch {}
+    const res = await fetch('/api/admin/pricing', {
+      method: 'POST',
+      headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(config)
+    });
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || 'Admin authorization failed.');
+    }
+    result = await res.json();
     await syncConfigSnapshotToFirestore({ pricingConfig: result });
     return result;
   },
@@ -1101,9 +1097,13 @@ export const api = {
   async adminSaveService(service: AdvertisingService): Promise<AdvertisingService[]> {
     const res = await fetch('/api/admin/services', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(service)
     });
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || 'Admin authorization failed.');
+    }
     const list = await res.json().catch(() => DEFAULT_SERVICES);
     await syncConfigSnapshotToFirestore({
       allServices: list,
@@ -1113,21 +1113,19 @@ export const api = {
   },
 
   async adminSavePackage(pkg: AdvertisingPackage): Promise<AdvertisingPackage[]> {
-    let list = this.getCachedOrFallbackConfig().allPackages;
-    try {
-      const res = await fetch('/api/admin/packages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(pkg)
-      });
-      if (res.ok) list = await res.json();
-    } catch {
-      const idx = list.findIndex((p) => p.id === pkg.id);
-      list = idx !== -1 ? list.map((p) => (p.id === pkg.id ? pkg : p)) : [...list, pkg];
+    const res = await fetch('/api/admin/packages', {
+      method: 'POST',
+      headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(pkg)
+    });
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || 'Admin authorization failed.');
     }
+    const list = await res.json();
     await syncConfigSnapshotToFirestore({
       allPackages: list,
-      packages: list.filter((p) => p.status !== 'inactive')
+      packages: list.filter((p: AdvertisingPackage) => p.status !== 'inactive')
     });
     return list;
   },
@@ -1135,17 +1133,18 @@ export const api = {
   async adminDeletePackage(id: string): Promise<AdvertisingPackage[]> {
     let list = this.getCachedOrFallbackConfig().allPackages.filter((p) => p.id !== id);
     let updatedAt: string | undefined;
-    try {
-      const res = await fetch(`/api/admin/packages/${encodeURIComponent(id)}`, {
-        method: 'DELETE'
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (Array.isArray(data)) list = data;
-        else if (Array.isArray(data.packages)) list = data.packages;
-        if (data.updatedAt) updatedAt = data.updatedAt;
-      }
-    } catch {}
+    const res = await fetch(`/api/admin/packages/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: this.getAuthHeaders()
+    });
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || 'Admin authorization failed.');
+    }
+    const data = await res.json();
+    if (Array.isArray(data)) list = data;
+    else if (Array.isArray(data.packages)) list = data.packages;
+    if (data.updatedAt) updatedAt = data.updatedAt;
     await syncConfigSnapshotToFirestore({
       allPackages: list,
       packages: list.filter((p) => p.status !== 'inactive')
@@ -1154,36 +1153,40 @@ export const api = {
   },
 
   async adminUpdateContent(content: Partial<WebsiteContent>): Promise<WebsiteContent> {
-    let result = { ...this.getCachedOrFallbackConfig().content, ...content };
-    try {
-      const res = await fetch('/api/admin/content', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(content)
-      });
-      if (res.ok) result = await res.json();
-    } catch {}
+    const res = await fetch('/api/admin/content', {
+      method: 'POST',
+      headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(content)
+    });
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || 'Admin authorization failed.');
+    }
+    const result = await res.json();
     await syncConfigSnapshotToFirestore({ content: result });
     return result;
   },
 
   async adminUpdateEmailTemplates(emailTemplates: EmailTemplatesConfig): Promise<{ success: boolean; emailTemplates: EmailTemplatesConfig; cloudSynced?: boolean }> {
-    let result: any = { success: true, emailTemplates };
-    try {
-      const res = await fetch('/api/admin/email-templates', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(emailTemplates)
-      });
-      if (res.ok) result = await res.json();
-    } catch {}
+    const res = await fetch('/api/admin/email-templates', {
+      method: 'POST',
+      headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(emailTemplates)
+    });
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || 'Admin authorization failed.');
+    }
+    const result = await res.json();
     const cloudSynced = await syncConfigSnapshotToFirestore({ emailTemplates: result.emailTemplates }, result.updatedAt);
     return { ...result, cloudSynced };
   },
 
   // --- Admin Integrations (Paystack & Brevo) ---
   async adminGetIntegrations(): Promise<any> {
-    const res = await fetch('/api/admin/integrations');
+    const res = await fetch('/api/admin/integrations', {
+      headers: this.getAuthHeaders()
+    });
     if (res.ok) return res.json();
     return {
       paystackConfig: {
@@ -1207,7 +1210,7 @@ export const api = {
   async adminUpdatePaystack(payload: { publicKey?: string; secretKey?: string; isLive?: boolean }): Promise<any> {
     const res = await fetch('/api/admin/integrations/paystack', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload)
     });
     return res.json();
@@ -1223,7 +1226,7 @@ export const api = {
   }): Promise<any> {
     const res = await fetch('/api/admin/integrations/brevo', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload)
     });
     return res.json();
@@ -1236,7 +1239,7 @@ export const api = {
   ): Promise<any> {
     const res = await fetch('/api/admin/integrations/brevo/test', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: this.getAuthHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ toEmail, toName, templateKey })
     });
     return res.json();

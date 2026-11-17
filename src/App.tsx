@@ -26,6 +26,8 @@ import { CustomerPortal } from './components/CustomerPortal.tsx';
 import { AdminDashboard } from './components/AdminDashboard.tsx';
 import { AuthPage } from './components/AuthPage.tsx';
 import { Footer } from './components/Footer.tsx';
+import { SiteSearchModal } from './components/SiteSearchModal.tsx';
+import { syncDynamicSeo } from './utils/seo.ts';
 import { RefreshCw, AlertCircle, CheckCircle2, Zap } from 'lucide-react';
 
 export default function App() {
@@ -50,23 +52,15 @@ export default function App() {
   const [activeView, setActiveView] = useState<'home' | 'portal' | 'admin' | 'auth'>('home');
   const [currentCurrencyCode, setCurrentCurrencyCode] = useState<CurrencyCode>('GHS');
   const [selectedPackageId, setSelectedPackageId] = useState<string | null>(null);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [externalOpenFaqIndex, setExternalOpenFaqIndex] = useState<number | null>(null);
 
   // Flash Notification
   const [notification, setNotification] = useState<{ type: 'success' | 'info'; message: string } | null>(null);
 
-  const syncDocumentHead = (cfg: PlatformConfigResponse) => {
-    if (cfg.branding?.siteTitle) {
-      document.title = cfg.branding.siteTitle;
-      const ogTitle = document.querySelector('meta[property="og:title"]');
-      if (ogTitle) ogTitle.setAttribute('content', cfg.branding.siteTitle);
-    }
-    if (cfg.content?.metaDescription) {
-      const metaDesc = document.querySelector('meta[name="description"]');
-      if (metaDesc) metaDesc.setAttribute('content', cfg.content.metaDescription);
-      const ogDesc = document.querySelector('meta[property="og:description"]');
-      if (ogDesc) ogDesc.setAttribute('content', cfg.content.metaDescription);
-    }
-  };
+  useEffect(() => {
+    syncDynamicSeo(config, activeView);
+  }, [config, activeView]);
 
   const applyConfigState = (nextCfg: PlatformConfigResponse) => {
     setConfig((prev) => {
@@ -77,7 +71,6 @@ export default function App() {
       }
       return nextCfg;
     });
-    syncDocumentHead(nextCfg);
   };
 
   const loadData = async (isRetry = false) => {
@@ -154,7 +147,6 @@ export default function App() {
         try {
           localStorage.setItem('adpulse_config_cache', JSON.stringify(next));
         } catch {}
-        syncDocumentHead(next);
         return next;
       });
     });
@@ -178,6 +170,20 @@ export default function App() {
         });
     }
 
+    // Global Cmd+K / Ctrl+K shortcut for Smart Site Search
+    const onGlobalKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setIsSearchOpen((prev) => !prev);
+      }
+    };
+    window.addEventListener('keydown', onGlobalKeyDown);
+
+    // Support Schema.org SearchAction (?q=...) deep links
+    if (params.get('q')) {
+      setIsSearchOpen(true);
+    }
+
     // Periodic background sync of exchange rates and orders
     const interval = setInterval(() => {
       loadData(true);
@@ -185,6 +191,7 @@ export default function App() {
     return () => {
       clearInterval(interval);
       unsubSettings();
+      window.removeEventListener('keydown', onGlobalKeyDown);
       window.removeEventListener('adpulse-config-updated', onLocalConfigUpdated);
       window.removeEventListener('adpulse-orders-updated', onLocalOrdersUpdated);
     };
@@ -218,6 +225,7 @@ export default function App() {
 
   const handleLogout = async () => {
     setCurrentUser(null);
+    api.clearAuthToken();
     try {
       localStorage.removeItem('adpulse_auth_user');
     } catch {}
@@ -228,7 +236,7 @@ export default function App() {
 
   const handleChangeView = (view: 'home' | 'portal' | 'admin' | 'auth') => {
     if (view === 'admin') {
-      if (!currentUser) {
+      if (!currentUser || !api.getAuthToken()) {
         setAuthIntendedRole('admin');
         setActiveView('auth');
         return;
@@ -246,7 +254,7 @@ export default function App() {
     }
 
     if (view === 'portal') {
-      if (!currentUser) {
+      if (!currentUser || !api.getAuthToken()) {
         setAuthIntendedRole('customer');
         setActiveView('auth');
         return;
@@ -345,9 +353,39 @@ export default function App() {
           const el = document.getElementById('packages');
           el?.scrollIntoView({ behavior: 'smooth' });
         }}
+        onOpenSearch={() => setIsSearchOpen(true)}
         currentUser={currentUser}
         onLogout={handleLogout}
         branding={config.branding}
+      />
+
+      {/* Smart Search Modal (Cmd+K / Ctrl+K) */}
+      <SiteSearchModal
+        isOpen={isSearchOpen}
+        onClose={() => setIsSearchOpen(false)}
+        packages={config.packages}
+        faqs={config.content.faqs || []}
+        currencies={config.currencies}
+        currentCurrency={selectedCurrency}
+        onSelectPackage={(pkg) => {
+          setSelectedPackageId(pkg.id);
+          if (activeView !== 'home') {
+            setActiveView('home');
+            setTimeout(() => document.getElementById('checkout')?.scrollIntoView({ behavior: 'smooth' }), 120);
+          } else {
+            document.getElementById('checkout')?.scrollIntoView({ behavior: 'smooth' });
+          }
+        }}
+        onSelectCurrency={(code) => setCurrentCurrencyCode(code)}
+        onJumpToFaq={(faqIdx) => {
+          setExternalOpenFaqIndex(faqIdx);
+          if (activeView !== 'home') {
+            setActiveView('home');
+            setTimeout(() => document.getElementById('faq')?.scrollIntoView({ behavior: 'smooth' }), 120);
+          } else {
+            document.getElementById('faq')?.scrollIntoView({ behavior: 'smooth' });
+          }
+        }}
       />
 
       {/* Main View Router */}
@@ -399,7 +437,10 @@ export default function App() {
               />
             )}
 
-            <HowItWorksAndFaqSection content={config.content} />
+            <HowItWorksAndFaqSection
+              content={config.content}
+              externalOpenFaqIndex={externalOpenFaqIndex}
+            />
           </>
         )}
 
@@ -455,9 +496,9 @@ export default function App() {
           )
         )}
 
-        {/* ADMIN DASHBOARD (Protected: Accessible ONLY by authenticated Admin Gideon Baffour) */}
+        {/* ADMIN DASHBOARD (Protected: Accessible ONLY by authenticated Admin with verified session token) */}
         {activeView === 'admin' && (
-          (currentUser?.email.toLowerCase() === 'baffourgideon05@gmail.com' || currentUser?.role === 'admin') ? (
+          (currentUser && api.getAuthToken() && (currentUser.email.toLowerCase() === 'baffourgideon05@gmail.com' || currentUser.role === 'admin')) ? (
             <AdminDashboard
               currencies={config.allCurrencies}
               pricingConfig={config.pricingConfig}

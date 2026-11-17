@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { CurrencyCode, Currency, UserAccount, SiteBranding } from '../types/index.ts';
-import { Globe, Shield, User, LayoutDashboard, Menu, X, ArrowRight, LogIn, LogOut } from 'lucide-react';
+import { Globe, Shield, Menu, X, ArrowRight, LogIn, LogOut, Search } from 'lucide-react';
 
 interface NavbarProps {
   currentCurrency: CurrencyCode;
@@ -9,6 +9,7 @@ interface NavbarProps {
   activeView: 'home' | 'portal' | 'admin' | 'auth';
   onChangeView: (view: 'home' | 'portal' | 'admin' | 'auth') => void;
   onOpenCampaignBuilder: () => void;
+  onOpenSearch: () => void;
   currentUser: UserAccount | null;
   onLogout: () => void;
   branding: SiteBranding;
@@ -21,6 +22,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   activeView,
   onChangeView,
   onOpenCampaignBuilder,
+  onOpenSearch,
   currentUser,
   onLogout,
   branding
@@ -77,8 +79,23 @@ export const Navbar: React.FC<NavbarProps> = ({
             )}
           </nav>
 
-          {/* Zone 3: Currency Selector + Auth State + Primary Action */}
-          <div className="flex items-center gap-3 shrink-0">
+          {/* Zone 3: Search + Currency Selector + Auth State + Primary Action */}
+          <div className="flex items-center gap-2.5 shrink-0">
+            {/* Smart Site Search Trigger */}
+            <button
+              type="button"
+              onClick={onOpenSearch}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+              title="Search packages & FAQs (Ctrl+K)"
+              aria-label="Search packages and FAQs"
+            >
+              <Search className="w-3.5 h-3.5 text-neutral-600" />
+              <span className="hidden xl:inline">Search</span>
+              <kbd className="hidden xl:inline text-[10px] font-mono text-neutral-400 bg-white px-1 py-0.5 rounded border border-neutral-200">
+                Ctrl+K
+              </kbd>
+            </button>
+
             {/* Currency Selector */}
             <div className="relative">
               <button

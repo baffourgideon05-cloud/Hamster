@@ -153,7 +153,8 @@ export const AuthPage: React.FC<AuthPageProps> = ({
         email: fbProfile.email,
         name: fbProfile.name,
         picture: fbProfile.picture,
-        sub: fbProfile.uid
+        sub: fbProfile.uid,
+        idToken: fbProfile.idToken
       });
 
       setSuccessMessage(`Google identity verified as ${res.user.email}! Accessing your workspace...`);
@@ -167,6 +168,10 @@ export const AuthPage: React.FC<AuthPageProps> = ({
         setErrorMessage('Google Sign-In window was closed before completing authentication.');
       } else if (err?.code === 'auth/popup-blocked') {
         setErrorMessage('Popup was blocked by your browser. Please allow popups for this site and retry.');
+      } else if (err?.code === 'auth/unauthorized-domain') {
+        setErrorMessage(
+          `Add "${window.location.hostname}" to Firebase Console Authorized Domains for Google Popup Sign-In, or sign in with Email & Password below.`
+        );
       } else {
         setErrorMessage(err?.message || 'Google authentication encountered an error.');
       }
@@ -611,7 +616,7 @@ export const AuthPage: React.FC<AuthPageProps> = ({
             {/* Security Guarantee */}
             <div className="pt-4 border-t border-neutral-100 flex items-center justify-center gap-2 text-[11px] text-neutral-400">
               <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-              <span>SHA-256 &amp; Google OAuth Verified · PCI-DSS Compliant</span>
+              <span>scrypt &amp; HMAC-SHA256 Verified · Paystack PCI-DSS Compliant</span>
             </div>
           </div>
         </div>

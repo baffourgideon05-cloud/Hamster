@@ -6,6 +6,22 @@ import { createServer as createViteServer } from 'vite';
 import { store } from './src/server/dataStore.ts';
 import { BrevoEmailService } from './src/server/brevoService.ts';
 import { CurrencyCode, FundingArrangement } from './src/types/index.ts';
+import {
+  buildRobotsTxt,
+  buildSitemapXml,
+  checkRateLimit,
+  createOrderAccessToken,
+  createSessionToken,
+  extractBearerToken,
+  getRequestOrigin,
+  getSecurityHeaders,
+  isValidEmail,
+  sanitizePlainText,
+  verifyFirebaseIdToken,
+  verifyOrderAccessToken,
+  verifySessionToken,
+  type SessionPayload
+} from './src/server/security.ts';
 
 const brevoService = new BrevoEmailService(store.getDb().brevoConfig);
 
@@ -16,17 +32,77 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const isProd = process.env.NODE_ENV === 'production';
 
-app.use(express.json());
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '512kb' }));
 
-// Enable CORS and preflight handling for all requests
-app.use((_req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  if (_req.method === 'OPTIONS') {
+function getClientIp(req: express.Request): string {
+  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0]?.trim();
+  return forwarded || req.ip || req.socket.remoteAddress || 'unknown';
+}
+
+function getSessionFromRequest(req: express.Request): SessionPayload | null {
+  const bearer = extractBearerToken(req.headers.authorization);
+  return verifySessionToken(bearer);
+}
+
+function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const session = getSessionFromRequest(req);
+  if (!session) {
+    return res.status(401).json({ error: 'Authentication required. Please sign in to continue.' });
+  }
+  if (session.role !== 'admin') {
+    return res.status(403).json({ error: 'Forbidden: Administrator privileges required.' });
+  }
+  next();
+}
+
+// Security Headers + Multi-Domain / Subdomain CORS Middleware
+app.use((req, res, next) => {
+  const originUrl = getRequestOrigin(req.headers, `http://localhost:${PORT}`);
+  const isHttps = originUrl.startsWith('https://');
+  const secHeaders = getSecurityHeaders(isHttps);
+  for (const [k, v] of Object.entries(secHeaders)) {
+    res.setHeader(k, v);
+  }
+
+  const reqOrigin = req.headers.origin;
+  res.setHeader('Access-Control-Allow-Origin', reqOrigin || '*');
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Order-Token');
+
+  if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
   next();
+});
+
+// Protect ALL /api/admin/* endpoints with signed Admin session verification
+app.use('/api/admin', requireAdmin);
+
+// Dynamic Multi-Domain Search Engine Discovery Files
+app.get('/robots.txt', (req, res) => {
+  const origin = getRequestOrigin(req.headers, `http://localhost:${PORT}`);
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.send(buildRobotsTxt(origin));
+});
+
+app.get('/sitemap.xml', (req, res) => {
+  const db = store.getDb();
+  const origin = getRequestOrigin(req.headers, `http://localhost:${PORT}`);
+  res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.send(
+    buildSitemapXml(origin, {
+      updatedAt: db.updatedAt,
+      branding: db.branding,
+      packages: db.packages,
+      content: db.content,
+      footerConfig: db.footerConfig
+    })
+  );
 });
 
 // 1. Get initial public platform configuration
@@ -57,17 +133,28 @@ app.get('/api/config', (_req, res) => {
 // Register customer
 app.post('/api/auth/register', (req, res) => {
   try {
-    const { name, email, password, phone } = req.body;
-    if (!name || !email || !password) {
-      return res.status(400).json({ error: 'Name, email, and password are required' });
+    const ip = getClientIp(req);
+    const limit = checkRateLimit(`register:${ip}`, 10, 10 * 60 * 1000);
+    if (!limit.allowed) {
+      res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+      return res.status(429).json({ error: 'Too many registration attempts. Please wait a few minutes.' });
+    }
+
+    const name = sanitizePlainText(req.body?.name, 120);
+    const email = sanitizePlainText(req.body?.email, 254).toLowerCase();
+    const phone = sanitizePlainText(req.body?.phone, 40);
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+
+    if (!name || !isValidEmail(email) || password.length < 6) {
+      return res.status(400).json({ error: 'Valid name, email address, and a password of at least 6 characters are required.' });
     }
     const result = store.registerUser({ name, email, password, phone });
-    if (!result.success) {
+    if (!result.success || !result.user) {
       return res.status(400).json({ error: result.error });
     }
-    // Return safe user object (omit passwordHash)
-    const { passwordHash, ...safeUser } = result.user!;
-    res.json({ success: true, user: safeUser });
+    const { passwordHash, ...safeUser } = result.user;
+    const token = createSessionToken({ id: safeUser.id, email: safeUser.email, role: safeUser.role });
+    res.json({ success: true, user: safeUser, token });
   } catch (err: any) {
     res.status(500).json({ error: 'Registration failed', details: err.message });
   }
@@ -76,36 +163,63 @@ app.post('/api/auth/register', (req, res) => {
 // Email/Password Login (Both Client and Admin use this unified login)
 app.post('/api/auth/login', (req, res) => {
   try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
+    const ip = getClientIp(req);
+    const email = sanitizePlainText(req.body?.email, 254).toLowerCase();
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+
+    const limit = checkRateLimit(`login:${ip}:${email}`, 12, 5 * 60 * 1000);
+    if (!limit.allowed) {
+      res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+      return res.status(429).json({
+        error: `Too many sign-in attempts. Please wait ${limit.retryAfterSeconds} seconds before trying again.`
+      });
+    }
+
+    if (!isValidEmail(email) || !password) {
+      return res.status(400).json({ error: 'Valid email and password are required' });
     }
     const result = store.authenticateEmail(email, password);
-    if (!result.success) {
-      return res.status(401).json({ error: result.error });
+    if (!result.success || !result.user) {
+      return res.status(401).json({ error: result.error || 'Invalid email or password.' });
     }
-    const { passwordHash, ...safeUser } = result.user!;
-    res.json({ success: true, user: safeUser });
+    const { passwordHash, ...safeUser } = result.user;
+    const token = createSessionToken({ id: safeUser.id, email: safeUser.email, role: safeUser.role });
+    res.json({ success: true, user: safeUser, token });
   } catch (err: any) {
     res.status(500).json({ error: 'Login failed', details: err.message });
   }
 });
 
-// Google Login (Both Client and Admin use the same system, but admin role is granted ONLY if email matches Admin Google Account)
-app.post('/api/auth/google', (req, res) => {
+// Google Login (Cryptographically verifies Firebase Google ID Token before granting session or admin role)
+app.post('/api/auth/google', async (req, res) => {
   try {
-    const { email, name, picture, sub } = req.body;
-    if (!email) {
-      return res.status(400).json({ error: 'Google email is required' });
+    const ip = getClientIp(req);
+    const limit = checkRateLimit(`google:${ip}`, 15, 5 * 60 * 1000);
+    if (!limit.allowed) {
+      res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+      return res.status(429).json({ error: 'Too many authentication attempts. Please wait shortly.' });
     }
 
-    const result = store.authenticateGoogle({ email, name: name || email.split('@')[0], picture, sub });
+    const { idToken, name, picture } = req.body || {};
+    const verified = await verifyFirebaseIdToken(idToken);
+    if (!verified.valid || !verified.email) {
+      return res.status(401).json({ error: verified.error || 'Google authentication token could not be verified.' });
+    }
+
+    const result = store.authenticateGoogle({
+      email: verified.email,
+      name: sanitizePlainText(verified.name || name || verified.email.split('@')[0], 120),
+      picture: typeof (verified.picture || picture) === 'string' ? String(verified.picture || picture).slice(0, 500) : undefined,
+      sub: verified.uid
+    });
     const { passwordHash, ...safeUser } = result.user;
+    const token = createSessionToken({ id: safeUser.id, email: safeUser.email, role: safeUser.role });
 
     res.json({
       success: true,
       user: safeUser,
-      isAdmin: result.isAdmin
+      isAdmin: result.isAdmin,
+      token
     });
   } catch (err: any) {
     res.status(500).json({ error: 'Google authentication failed', details: err.message });
@@ -115,9 +229,16 @@ app.post('/api/auth/google', (req, res) => {
 // Customer Forgot Password Request
 app.post('/api/auth/forgot-password', (req, res) => {
   try {
-    const { email } = req.body;
-    if (!email) {
-      return res.status(400).json({ error: 'Email is required' });
+    const ip = getClientIp(req);
+    const limit = checkRateLimit(`forgot:${ip}`, 6, 10 * 60 * 1000);
+    if (!limit.allowed) {
+      res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+      return res.status(429).json({ error: 'Too many reset requests. Please try again later.' });
+    }
+
+    const email = sanitizePlainText(req.body?.email, 254).toLowerCase();
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: 'A valid email address is required' });
     }
     const result = store.requestPasswordReset(email);
     res.json(result);
@@ -410,11 +531,15 @@ app.post('/api/pricing/calculate', (req, res) => {
 // Create a new Order & checkout intent
 app.post('/api/orders', (req, res) => {
   try {
+    const ip = getClientIp(req);
+    const limit = checkRateLimit(`order_create:${ip}`, 20, 10 * 60 * 1000);
+    if (!limit.allowed) {
+      res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+      return res.status(429).json({ error: 'Too many order requests. Please wait a moment.' });
+    }
+
     const {
       customerId,
-      customerEmail,
-      customerName,
-      customerPhone,
       serviceId,
       packageId,
       fundingArrangement,
@@ -424,8 +549,12 @@ app.post('/api/orders', (req, res) => {
       campaignBrief
     } = req.body;
 
-    if (!customerEmail || !customerName) {
-      return res.status(400).json({ error: 'Customer email and name are required' });
+    const customerEmail = sanitizePlainText(req.body?.customerEmail, 254).toLowerCase();
+    const customerName = sanitizePlainText(req.body?.customerName, 120);
+    const customerPhone = sanitizePlainText(req.body?.customerPhone, 40);
+
+    if (!isValidEmail(customerEmail) || !customerName) {
+      return res.status(400).json({ error: 'Valid customer email and full name are required' });
     }
 
     const effectiveCurrency = (targetCurrency || paymentCurrency || 'GHS').toUpperCase();
@@ -441,24 +570,53 @@ app.post('/api/orders', (req, res) => {
     const db = store.getDb();
     const orderId = `ORD-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`;
 
+    const cleanBrief = campaignBrief
+      ? {
+          businessName: sanitizePlainText(campaignBrief.businessName, 160) || customerName,
+          platform: ['facebook', 'instagram', 'both'].includes(campaignBrief.platform) ? campaignBrief.platform : 'both',
+          objective: sanitizePlainText(campaignBrief.objective, 80) || 'WhatsApp Conversations',
+          targetLocations: sanitizePlainText(campaignBrief.targetLocations, 200) || 'Ghana',
+          targetAge: sanitizePlainText(campaignBrief.targetAge, 40) || '21 - 55',
+          targetInterests: sanitizePlainText(campaignBrief.targetInterests, 240) || 'Buyers',
+          headline: sanitizePlainText(campaignBrief.headline, 240) || customerName,
+          primaryText: sanitizePlainText(campaignBrief.primaryText, 1200) || 'Message us on WhatsApp.',
+          callToAction: sanitizePlainText(campaignBrief.callToAction, 60) || 'Send WhatsApp Message',
+          destinationUrl: sanitizePlainText(campaignBrief.destinationUrl, 400) || 'https://wa.me/',
+          ...(campaignBrief.specialInstructions
+            ? { specialInstructions: sanitizePlainText(campaignBrief.specialInstructions, 1000) }
+            : {})
+        }
+      : {
+          businessName: customerName,
+          platform: 'both' as const,
+          objective: 'Lead Generation',
+          targetLocations: 'Ghana / International',
+          targetAge: '21 - 55',
+          targetInterests: 'Business, Retail, E-Commerce',
+          headline: 'Grow Your Business with Precision Targeted Ads',
+          primaryText: 'Reach qualified customers on Facebook and Instagram.',
+          callToAction: 'Learn More',
+          destinationUrl: 'https://wa.me/'
+        };
+
     const newOrder = {
       id: orderId,
       customerId: customerId || `usr-${Date.now()}`,
       customerEmail,
       customerName,
-      customerPhone: customerPhone || '',
+      customerPhone,
       serviceId: priceCalc.service.id,
       serviceName: priceCalc.service.name,
       packageId: priceCalc.package?.id,
       packageName: priceCalc.package?.name,
       fundingArrangement: priceCalc.fundingArrangement,
-      
+
       pricingCurrency: priceCalc.base.currency,
       adBudgetUSD: priceCalc.base.adBudgetUSD,
       agencyFeeUSD: priceCalc.base.agencyFeeUSD,
       taxUSD: priceCalc.base.taxUSD,
       totalUSD: priceCalc.base.totalUSD,
-      
+
       paymentCurrency: priceCalc.converted.currency,
       appliedExchangeRate: priceCalc.converted.effectiveRate,
       exchangeRateMarginPercent: priceCalc.converted.marginPercent,
@@ -466,22 +624,11 @@ app.post('/api/orders', (req, res) => {
       paymentAgencyFee: priceCalc.converted.paymentAgencyFee,
       paymentTax: priceCalc.converted.paymentTax,
       paymentTotal: priceCalc.converted.paymentTotal,
-      
+
       rateSnapshot: priceCalc.snapshot,
       paymentStatus: 'PENDING' as const,
-      
-      campaignBrief: campaignBrief || {
-        businessName: customerName,
-        platform: 'both',
-        objective: 'Lead Generation',
-        targetLocations: 'Ghana / International',
-        targetAge: '21 - 55',
-        targetInterests: 'Business, Retail, E-Commerce',
-        headline: 'Grow Your Business with Precision Targeted Ads',
-        primaryText: 'Reach qualified customers on Facebook and Instagram.',
-        callToAction: 'Learn More',
-        destinationUrl: 'https://example.com'
-      },
+
+      campaignBrief: cleanBrief,
       campaignStatus: 'DRAFT' as const,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
@@ -490,17 +637,25 @@ app.post('/api/orders', (req, res) => {
     db.orders.unshift(newOrder);
     store.commit();
 
-    res.status(201).json(newOrder);
+    const orderAccessToken = createOrderAccessToken(newOrder.id, newOrder.customerEmail);
+    res.status(201).json({ ...newOrder, orderAccessToken });
   } catch (err: any) {
     console.error('Order creation error:', err);
     res.status(500).json({ error: 'Failed to create order', details: err.message });
   }
 });
 
-// Paystack Initialize Transaction (Real Live API)
+// Paystack Initialize Transaction (Real Live API + Ownership Verification + Any-Domain Callback)
 app.post('/api/paystack/initialize', async (req, res) => {
   try {
-    const { orderId } = req.body;
+    const ip = getClientIp(req);
+    const limit = checkRateLimit(`pstk_init:${ip}`, 20, 10 * 60 * 1000);
+    if (!limit.allowed) {
+      res.setHeader('Retry-After', String(limit.retryAfterSeconds));
+      return res.status(429).json({ error: 'Too many payment requests. Please wait a moment.' });
+    }
+
+    const { orderId, orderAccessToken } = req.body || {};
     const db = store.getDb();
     const order = db.orders.find(o => o.id === orderId);
 
@@ -508,8 +663,19 @@ app.post('/api/paystack/initialize', async (req, res) => {
       return res.status(404).json({ error: 'Order not found' });
     }
 
+    const session = getSessionFromRequest(req);
+    const headerOrderToken = String(req.headers['x-order-token'] || orderAccessToken || '');
+    const authorized =
+      session?.role === 'admin' ||
+      (session && session.email === order.customerEmail.toLowerCase()) ||
+      verifyOrderAccessToken(headerOrderToken, order.id);
+
+    if (!authorized) {
+      return res.status(401).json({ error: 'Unauthorized payment initialization attempt.' });
+    }
+
     const secretKey = db.paystackConfig.secretKey || process.env.PAYSTACK_SECRET_KEY || '';
-    const origin = req.headers.origin || process.env.APP_URL || 'http://localhost:3000';
+    const origin = getRequestOrigin(req.headers, `http://localhost:${PORT}`);
     const callbackUrl = `${origin}/?orderId=${encodeURIComponent(order.id)}`;
 
     let chargeCurrency = order.paymentCurrency;
@@ -677,34 +843,75 @@ app.get('/api/paystack/verify/:reference', async (req, res) => {
   }
 });
 
-// Orders query
+// Orders query (PII Protected: returns only authorized orders for current user/admin)
 app.get('/api/orders', (req, res) => {
-  const { email } = req.query;
-  const db = store.getDb();
-  if (email && typeof email === 'string') {
-    const userOrders = db.orders.filter(o => o.customerEmail.toLowerCase() === email.toLowerCase());
-    return res.json(userOrders);
+  const session = getSessionFromRequest(req);
+  if (!session) {
+    return res.json([]);
   }
-  res.json(db.orders);
+  const db = store.getDb();
+  if (session.role === 'admin') {
+    const { email } = req.query;
+    if (email && typeof email === 'string') {
+      return res.json(db.orders.filter(o => o.customerEmail.toLowerCase() === email.toLowerCase()));
+    }
+    return res.json(db.orders);
+  }
+  return res.json(db.orders.filter(o => o.customerEmail.toLowerCase() === session.email));
 });
 
-// Get specific order by ID
+// Get specific order by ID (Requires matching customer/admin session or orderAccessToken)
 app.get('/api/orders/:id', (req, res) => {
   const db = store.getDb();
   const order = db.orders.find(o => o.id === req.params.id);
   if (!order) return res.status(404).json({ error: 'Order not found' });
+
+  const session = getSessionFromRequest(req);
+  const orderToken = String(req.headers['x-order-token'] || req.query.orderToken || '');
+  const authorized =
+    session?.role === 'admin' ||
+    (session && session.email === order.customerEmail.toLowerCase()) ||
+    verifyOrderAccessToken(orderToken, order.id);
+
+  if (!authorized) {
+    return res.status(401).json({ error: 'Authentication required to view this order.' });
+  }
   res.json(order);
 });
 
-// Update Campaign Requirements / Brief
+// Update Campaign Requirements / Brief (Requires matching customer/admin session or orderAccessToken)
 app.post('/api/orders/:id/brief', (req, res) => {
   const db = store.getDb();
   const order = db.orders.find(o => o.id === req.params.id);
   if (!order) return res.status(404).json({ error: 'Order not found' });
 
+  const session = getSessionFromRequest(req);
+  const orderToken = String(req.headers['x-order-token'] || req.body?.orderAccessToken || '');
+  const authorized =
+    session?.role === 'admin' ||
+    (session && session.email === order.customerEmail.toLowerCase()) ||
+    verifyOrderAccessToken(orderToken, order.id);
+
+  if (!authorized) {
+    return res.status(401).json({ error: 'Authentication required to update campaign brief.' });
+  }
+
+  const b = req.body || {};
   order.campaignBrief = {
     ...order.campaignBrief,
-    ...req.body
+    ...(b.businessName !== undefined ? { businessName: sanitizePlainText(b.businessName, 160) } : {}),
+    ...(b.websiteUrl !== undefined ? { websiteUrl: sanitizePlainText(b.websiteUrl, 400) } : {}),
+    ...(b.platform && ['facebook', 'instagram', 'both'].includes(b.platform) ? { platform: b.platform } : {}),
+    ...(b.objective !== undefined ? { objective: sanitizePlainText(b.objective, 80) } : {}),
+    ...(b.targetLocations !== undefined ? { targetLocations: sanitizePlainText(b.targetLocations, 200) } : {}),
+    ...(b.targetAge !== undefined ? { targetAge: sanitizePlainText(b.targetAge, 40) } : {}),
+    ...(b.targetInterests !== undefined ? { targetInterests: sanitizePlainText(b.targetInterests, 240) } : {}),
+    ...(b.headline !== undefined ? { headline: sanitizePlainText(b.headline, 240) } : {}),
+    ...(b.primaryText !== undefined ? { primaryText: sanitizePlainText(b.primaryText, 1200) } : {}),
+    ...(b.callToAction !== undefined ? { callToAction: sanitizePlainText(b.callToAction, 60) } : {}),
+    ...(b.destinationUrl !== undefined ? { destinationUrl: sanitizePlainText(b.destinationUrl, 400) } : {}),
+    ...(b.facebookPageOrHandle !== undefined ? { facebookPageOrHandle: sanitizePlainText(b.facebookPageOrHandle, 120) } : {}),
+    ...(b.specialInstructions !== undefined ? { specialInstructions: sanitizePlainText(b.specialInstructions, 1000) } : {})
   };
   if (order.campaignStatus === 'DRAFT') {
     order.campaignStatus = 'SUBMITTED';

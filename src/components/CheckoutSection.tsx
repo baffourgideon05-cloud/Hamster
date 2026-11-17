@@ -126,7 +126,7 @@ export const CheckoutSection: React.FC<CheckoutSectionProps> = ({
       });
 
       // 2. Initialize real live Paystack transaction on server (returns access_code & authorization_url)
-      const paystackTx = await api.initializePaystack(order.id);
+      const paystackTx = await api.initializePaystack(order.id, order.orderAccessToken);
       if (!paystackTx || !paystackTx.reference) {
         throw new Error('Could not initialize live Paystack transaction.');
       }
